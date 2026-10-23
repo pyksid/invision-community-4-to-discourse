@@ -1,0 +1,3 @@
+# Exports of the IPB production database
+ipb_*.sql
+ipb_*.txt

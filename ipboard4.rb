@@ -25,6 +25,20 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     }
     REACTIONS_EXCLUDED_FROM_LIKE = %w[thinking cry -1 angry]
 
+    # Hosts (and path prefix) the forum was served from, so absolute links to it are treated as internal
+    OLD_BASE_URLS = %w[community.lecrabeinfo.net lecrabeinfo.net/forums]
+
+    # Reduce old IPB URLs to the keys create_permalinks stores (rules are "|"-separated, so no "|" inside)
+    PERMALINK_NORMALIZATIONS = [
+        '/^forums\/topic\//topic/',
+        '/^forums\/forum\//forum/',
+        '/^forums\/profile\//profile/',
+        '/^topic\/\d+[^?]*\?.*\bcomment=(\d+).*/comment/\1',
+        '/^topic\/(\d+).*/topic/\1',
+        '/^forum\/(\d+).*/forum/\1',
+        '/^profile\/(\d+).*/profile/\1',
+    ]
+
     SiteSetting.disable_emails = "non-staff"
     SiteSetting.disable_digest_emails = true
 
@@ -50,6 +64,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_reactions
         import_tags
         import_articles
+        import_private_messages
+        import_private_message_replies
+        create_permalinks
     end
 
     # Primary and secondary (mgroup_others) group memberships
@@ -533,144 +550,381 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
+    # Only participants still in the conversation keep access (IPB removes it when they leave);
+    # messages from deleted members are attributed to the system user
+    def import_private_messages
+        puts "", "importing private messages..."
+
+        last_topic_id = -1
+        total_topics = mysql_count(<<~SQL)
+            SELECT COUNT(*) AS count
+            FROM #{TABLE_PREFIX}core_message_topics
+            WHERE mt_is_draft = 0
+            AND mt_is_deleted = 0
+        SQL
+
+        batches(BATCH_SIZE) do |offset|
+            topics = mysql_query(<<~SQL).to_a
+                SELECT t.mt_id AS id, t.mt_title AS title, p.msg_date, p.msg_post, p.msg_author_id,
+                    (SELECT GROUP_CONCAT(u.map_user_id)
+                     FROM #{TABLE_PREFIX}core_message_topic_user_map u
+                     WHERE u.map_topic_id = t.mt_id AND u.map_user_active = 1) AS participants
+                FROM #{TABLE_PREFIX}core_message_topics t
+                JOIN #{TABLE_PREFIX}core_message_posts p ON p.msg_topic_id = t.mt_id AND p.msg_is_first_post = 1
+                WHERE t.mt_is_draft = 0
+                AND t.mt_is_deleted = 0
+                AND t.mt_id > #{last_topic_id}
+                ORDER BY t.mt_id
+                LIMIT #{BATCH_SIZE}
+            SQL
+
+            break if topics.empty?
+
+            last_topic_id = topics[-1]["id"]
+
+            create_posts(topics, total: total_topics, offset: offset) do |t|
+                next if post_id_from_imported_post_id("pm-t-#{t["id"]}")
+
+                user_id = user_id_from_imported_user_id(t["msg_author_id"]) || Discourse::SYSTEM_USER_ID
+                participant_ids = t["participants"].to_s.split(",").map { |id| user_id_from_imported_user_id(id) }.compact - [user_id]
+
+                {
+                    id: "pm-t-#{t["id"]}",
+                    archetype: Archetype.private_message,
+                    title: CGI.unescapeHTML(t["title"].encode("utf-8", "utf-8")),
+                    user_id: user_id,
+                    target_usernames: User.where(id: participant_ids).pluck(:username),
+                    created_at: Time.zone.at(t["msg_date"]),
+                    raw: clean_up(t["msg_post"], user_id),
+                }
+            end
+        end
+    end
+
+    def import_private_message_replies
+        puts "", "importing private message replies..."
+
+        last_message_id = -1
+        total_messages = mysql_count("SELECT COUNT(*) count FROM #{TABLE_PREFIX}core_message_posts WHERE msg_is_first_post = 0")
+
+        batches(BATCH_SIZE) do |offset|
+            messages = mysql_query(<<~SQL).to_a
+                SELECT msg_id AS id, msg_topic_id, msg_date, msg_post, msg_author_id
+                FROM #{TABLE_PREFIX}core_message_posts
+                WHERE msg_is_first_post = 0
+                AND msg_id > #{last_message_id}
+                ORDER BY msg_id
+                LIMIT #{BATCH_SIZE}
+            SQL
+
+            break if messages.empty?
+
+            last_message_id = messages[-1]["id"]
+
+            create_posts(messages, total: total_messages, offset: offset) do |m|
+                next if post_id_from_imported_post_id("pm-#{m["id"]}")
+
+                # drafts and deleted conversations were not imported
+                topic = topic_lookup_from_imported_post_id("pm-t-#{m["msg_topic_id"]}")
+                next unless topic
+
+                user_id = user_id_from_imported_user_id(m["msg_author_id"]) || Discourse::SYSTEM_USER_ID
+
+                {
+                    id: "pm-#{m["id"]}",
+                    topic_id: topic[:topic_id],
+                    user_id: user_id,
+                    created_at: Time.zone.at(m["msg_date"]),
+                    raw: clean_up(m["msg_post"], user_id),
+                }
+            end
+        end
+    end
+
+    # Old IPB URLs are reduced by PERMALINK_NORMALIZATIONS to "topic/<tid>", "comment/<pid>",
+    # "forum/<id>" and "profile/<member_id>", which point to the imported records
+    def create_permalinks
+        puts "", "creating permalinks..."
+
+        SiteSetting.permalink_normalizations =
+            (SiteSetting.permalink_normalizations.split("|") | PERMALINK_NORMALIZATIONS).join("|")
+
+        rows = []
+
+        CategoryCustomField.where(name: "import_id").pluck(:value, :category_id).each do |id, category_id|
+            rows << { url: "forum/#{id}", category_id: category_id }
+        end
+
+        UserCustomField.where(name: "import_id").pluck(:value, :user_id).each do |id, user_id|
+            rows << { url: "profile/#{id}", user_id: user_id }
+        end
+
+        first_post_ids = first_post_topic_ids.invert
+        PostCustomField
+            .where(name: "import_id")
+            .joins(:post)
+            .pluck(:value, :post_id, "posts.topic_id")
+            .each do |id, post_id, topic_id|
+                if (tid = id[/\At-(\d+)\z/, 1])
+                    rows << { url: "topic/#{tid}", topic_id: topic_id }
+                    rows << { url: "comment/#{first_post_ids[tid.to_i]}", post_id: post_id } if first_post_ids[tid.to_i]
+                elsif id.match?(/\A\d+\z/)
+                    rows << { url: "comment/#{id}", post_id: post_id }
+                end
+            end
+
+        # insert_all needs the same keys on every row; it skips URLs that already have a permalink
+        blank = { topic_id: nil, post_id: nil, category_id: nil, user_id: nil }
+        rows.each_slice(BATCH_SIZE) { |slice| Permalink.insert_all(slice.map { |row| blank.merge(row) }) }
+        puts "#{rows.size} permalinks processed"
+    end
+
     def staff_guardian
         @_staff_guardian ||= Guardian.new(Discourse.system_user)
     end
 
+    # Converts IPB HTML to Discourse Markdown. Discourse-specific text (quote/details BBCode,
+    # mentions, emoji codes, upload markdown, onebox URLs) goes through placeholders so
+    # ReverseMarkdown neither escapes it nor reflows it
     def clean_up(raw, user_id = -1)
         return if raw.nil?
 
         raw.encode!("utf-8", "utf-8", invalid: :replace, undef: :replace, replace: "")
 
         begin
-            raw.encode!("utf-8", "utf-8", invalid: :replace, undef: :replace, replace: "")
             Regexp.timeout = 5
             raw.gsub!(%r{<(.+)>&nbsp;</\1>}, "\n\n")
-    
         rescue Regexp::TimeoutError => e
             puts "Regex Timeout Error while processing text: #{raw[0..100]}..."
             return
         end
-      
+
+        @placeholders = []
         doc = Nokogiri::HTML5.fragment(raw)
 
-        doc.css("blockquote.ipsBlockquote").each do |bq|
-          post_id = post_id_from_imported_pid(bq["data-cid"])
-          if post = Post.find_by(id: post_id)
-            bq.replace %{<br>[quote="#{post.user.username},post:#{post.post_number},topic:#{post.topic_id}"]\n#{bq.inner_html}\n[/quote]<br>}
-          end
+        # innermost first, so outer blocks carry the already converted inner ones
+        doc.css("blockquote.ipsQuote").reverse_each do |bq|
+            bq.css(".ipsQuote_citation").each(&:remove)
+            header = quote_header(bq)
+            open_tag = header.present? ? %{[quote="#{header}"]} : "[quote]"
+            wrap_block(bq, bq.at_css(".ipsQuote_contents") || bq, open_tag, "[/quote]")
         end
 
-        doc.css("a").each do |a|
-            href = a["href"].to_s
-            img = a.previous_element if a.previous_element&.name == "img"
-            
-            if href.start_with?("<___base_url___>/index.php?app=core&module=attach")
-                if (match_data = href.match(/attach_id=(\d+)/))
-                    upload, filename = upload_attachment(match_data[1].to_i, user_id)
-                    if upload
-                        new_url = html_for_upload(upload, filename)
-                        if img
-                            img.replace(new_url)
-                            a.remove
-                        else
-                            a.replace(new_url)
-                        end
-                    end
-                end
-            elsif (match_data = href.match(%r{/attachment\.php\?id=(\d+)}))
-                upload, filename = upload_attachment(match_data[1].to_i, user_id)
-                a.replace(html_for_upload(upload, filename)) if upload
-            elsif(a["href"].to_s.start_with?("<fileStore.core_Attachment>/"))
-                filename = File.basename(a["href"].to_s).encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
-                extracted_path = a["href"].to_s.sub("<fileStore.core_Attachment>/", "")
-                path = File.join(UPLOADS_DIR, extracted_path)
-                if File.exist?(path)
-                    begin
-                        upload = create_upload(user_id, path, filename)
-                        if upload&.persisted?
-                            new_url = html_for_upload(upload, filename)
-                            a.replace(new_url)
-                        end
-                    rescue StandardError => e
-                    end
-                end
-            elsif(a["href"].to_s.start_with?("<"))
-                a.remove
-            end
+        doc.css("div.ipsSpoiler").reverse_each do |spoiler|
+            title = spoiler.at_css(".ipsSpoiler_header")&.text.to_s.gsub(/[[:space:]]+/, " ").strip.delete('"').presence || "Spoiler"
+            wrap_block(spoiler, spoiler.at_css(".ipsSpoiler_contents") || spoiler, %{[details="#{title}"]}, "[/details]")
+        end
+
+        doc.css("a[data-mentionid]").each do |a|
+            user = User.find_by(id: user_id_from_imported_user_id(a["data-mentionid"]))
+            replace_with_text(a, user ? placeholder("@#{user.username}") : a.text)
         end
 
         doc.css("img").each do |img|
-            img["src"] = img["data-src"] if img["data-src"].present?
+            next unless img.key?("data-emoticon") || img["src"].to_s.include?("emoticons/")
+
+            text = emoticon_text(img["alt"].to_s.strip)
+            text.present? ? replace_with_text(img, placeholder(text)) : img.remove
+        end
+
+        # thumbnails are wrapped in a link to the full-size file: upload the link target once
+        doc.css("a").each do |a|
+            fileid = a["data-fileid"] || a.at_css("img[data-fileid]")&.[]("data-fileid")
+            next unless fileid || local_upload_path(a["href"]) || a["href"].to_s.match?(/attachment\.php\?id=\d+/)
+
+            markdown = upload_markdown(a["href"], fileid, user_id)
+            replace_with_text(a, placeholder(markdown)) if markdown
+        end
+
+        doc.css("video").each do |video|
+            source = video.at_css("source")
+            markdown = source && upload_markdown(source["data-video-src"].presence || source["src"], nil, user_id)
+            markdown ? replace_with_text(video, placeholder("\n#{markdown}\n")) : video.remove
+        end
+
+        doc.css("img").each do |img|
+            src = CGI.unescapeHTML(img["data-src"].presence || img["src"].to_s)
             img.remove_attribute("data-src")
-            src = img["src"].to_s
 
-            path, filename =
-                if (match = src.match(%r{/uploads/imageproxy/([^/]+)$}))
-                    [File.join(UPLOADS_DIR, "imageproxy", match[1]), match[1]]
-                elsif src.start_with?("<fileStore.core_Attachment>/")
-                    extracted_path = src.sub("<fileStore.core_Attachment>/", "")
-                    [File.join(UPLOADS_DIR, extracted_path), File.basename(extracted_path)]
-                elsif (match = src.match(%r{^uploads/emoticons/(.+)$}))
-                    [File.join(UPLOADS_DIR, "emoticons", match[1]), match[1]]
-                end
-
-            if path
-                upload =
-                    begin
-                        create_upload(user_id, path, filename) if File.exist?(path)
-                    rescue StandardError => e
-                        puts "Error uploading image #{path}: #{e.message}"
-                        nil
-                    end
-
-                if upload&.persisted?
-                    img.replace(html_for_upload(upload, filename))
-                else
-                    puts "File not found: #{path}" unless File.exist?(path)
-                    img.remove
-                end
-            elsif !src.match?(%r{\Ahttps?://}i)
+            if src.match?(%r{\A(?:https?:)?//}i) && !ipb_path(src)
+                img["src"] = src.start_with?("//") ? "https:#{src}" : src
+                img.remove_attribute("alt") if img["alt"].to_s.include?("spacer.png")
+            elsif (markdown = upload_markdown(src, img["data-fileid"], user_id))
+                replace_with_text(img, placeholder(markdown))
+            else
                 img.remove
             end
         end
 
         doc.css("iframe").each do |iframe|
-            url = iframe["data-embed-src"] || iframe["src"]
-            next unless url
-    
-            if match = url.match(%r{<___base_url___>/index\.php\?app=core&module=system&controller=embed&url=(.+)$})
-                embedded_url = CGI.unescape(CGI.unescapeHTML(CGI.unescape(match[1])))
-            elsif url.start_with?("https://www.youtube.com/embed/") or url.start_with?("https://www.youtube-nocookie.com/embed/")
-                youtube_id = url.match(%r{/embed/([^?]+)})[1]
-                embedded_url = "https://www.youtube.com/watch?v=#{youtube_id}"
-            elsif (match = url.match(%r{/topic/(\d+)-.*\?do=embed}))
-                topic = topic_lookup_from_imported_post_id("t-#{match[1]}")
-                embedded_url = "#{Discourse.base_url}/t/#{topic[:topic_id]}" if topic
+            url = embed_url(iframe["data-embed-src"].presence || iframe["src"])
+            url ? replace_with_text(iframe, placeholder("\n\n#{url}\n\n")) : iframe.remove
+        end
+
+        # internal links point to the Discourse equivalent, or to the IPB path that a permalink
+        # redirects; other "<___base_url___>" links are unwrapped to keep their text
+        doc.css("a[href]").each do |a|
+            path = ipb_path(a["href"])
+            next unless path || a["href"].start_with?("<")
+
+            url = path && (discourse_url_for(path) || (path if path.match?(%r{\A/(?:topic|forum|profile)/\d+})))
+            if url
+                a["href"] = url
             else
-                iframe.replace(url)
-            end
-            if embedded_url
-                parent = iframe.ancestors.to_a.find { |el| el.parent } || iframe
-                formatted_url = "\n#{embedded_url.strip}\n"
-                if parent && parent.parent
-                    parent.content = formatted_url
-                else
-                    iframe.content = formatted_url
-                end
-            else 
-                parent = iframe.ancestors.to_a.find { |el| el.parent }
-                
-                if parent && parent.parent
-                    parent.remove
-                else
-                    iframe.remove
-                end
+                a.replace(a.children)
             end
         end
 
-        markdown = ReverseMarkdown.convert(doc.to_html)
-        markdown
+        markdown = ReverseMarkdown.convert(doc.to_html).gsub("&nbsp;", " ")
+        markdown.gsub(/IPBPH(\d+)X/) { @placeholders[$1.to_i] }
+    end
+
+    def placeholder(text)
+        @placeholders << text
+        "IPBPH#{@placeholders.size - 1}X"
+    end
+
+    def replace_with_text(node, text)
+        node.replace(Nokogiri::XML::Text.new(text, node.document))
+    end
+
+    def wrap_block(node, contents, open_tag, close_tag)
+        node.replace("<p>#{placeholder(open_tag)}</p>#{contents.inner_html}<p>#{placeholder(close_tag)}</p>")
+    end
+
+    def quote_header(bq)
+        if bq["data-ipsquote-contentclass"] == "forums_Topic"
+            post = Post.find_by(id: post_id_from_imported_pid(bq["data-ipsquote-contentcommentid"]))
+            return "#{post.user.username}, post:#{post.post_number}, topic:#{post.topic_id}" if post&.user
+        end
+
+        user = User.find_by(id: user_id_from_imported_user_id(bq["data-ipsquote-userid"]))
+        (user&.username || bq["data-ipsquote-username"].to_s).delete('"')
+    end
+
+    # ":name:" codes become the Discourse emoji of the same name, or a custom emoji created from
+    # the IPB image; other codes (";)", ":P"...) stay as typed and Discourse's shortcuts handle them
+    def emoticon_text(alt)
+        name = alt[/\A:([\w+-]+):\z/, 1]&.downcase
+        return alt unless name
+        return ":#{name}:" if Emoji.exists?(name) || custom_emoji?(name, alt)
+
+        alt
+    end
+
+    def custom_emoji?(name, typed)
+        @custom_emojis ||= {}
+        return @custom_emojis[name] if @custom_emojis.key?(name)
+
+        @custom_emojis[name] = CustomEmoji.exists?(name: name) || create_custom_emoji(name, typed)
+    end
+
+    def create_custom_emoji(name, typed)
+        row = mysql_query("SELECT image, image_2x FROM #{TABLE_PREFIX}core_emoticons WHERE typed = '#{@client.escape(typed)}' LIMIT 1").first
+        image = row && (row["image_2x"].presence || row["image"])
+        path = image && File.join(UPLOADS_DIR, image)
+        return false unless path && File.exist?(path)
+
+        upload = create_upload(Discourse::SYSTEM_USER_ID, path, "#{name}#{File.extname(path)}")
+        return false unless upload&.persisted?
+
+        CustomEmoji.create!(name: name, upload: upload)
+        Emoji.clear_cache
+        true
+    rescue StandardError => e
+        puts "Error creating custom emoji #{name}: #{e.message}"
+        false
+    end
+
+    # Path of an internal IPB URL relative to the forum root (e.g. "/topic/12-slug/"), nil for external URLs
+    def ipb_path(url)
+        url = CGI.unescapeHTML(url.to_s.strip)
+        hosts = OLD_BASE_URLS.map { |host| Regexp.escape(host) }.join("|")
+
+        path =
+            if url.start_with?("<___base_url___>")
+                url.delete_prefix("<___base_url___>")
+            elsif (match = url.match(%r{\A(?:https?:)?//(?:www\.)?(?:#{hosts})(/.*)?\z}i))
+                match[1].to_s
+            end
+        return unless path
+
+        "/#{path.delete_prefix("/").delete_prefix("index.php?").delete_prefix("/")}".sub(%r{\A/forums/(?=(?:topic|forum|profile)/)}, "/")
+    end
+
+    def discourse_url_for(path)
+        if (topic_id = path[%r{\A/topic/(\d+)}, 1])
+            comment_id = path[/[?&#]comment[=-](\d+)/, 1]
+            post = Post.find_by(id: post_id_from_imported_pid(comment_id)) if comment_id
+            return post.url if post
+
+            topic = topic_lookup_from_imported_post_id("t-#{topic_id}")
+            Topic.find_by(id: topic[:topic_id])&.relative_url if topic
+        elsif (forum_id = path[%r{\A/forum/(\d+)}, 1])
+            Category.find_by(id: category_id_from_imported_category_id(forum_id))&.url
+        elsif (member_id = path[%r{\A/profile/(\d+)}, 1])
+            User.find_by(id: user_id_from_imported_user_id(member_id))&.relative_url
+        end
+    end
+
+    def embed_url(src)
+        src = CGI.unescapeHTML(src.to_s)
+
+        if src.include?("controller=embed") && (match = src.match(/[?&]url=([^&]+)/))
+            url = CGI.unescape(match[1])
+            url.match?(/\Ahttps?%3A/i) ? CGI.unescape(url) : url
+        elsif (match = src.match(%r{youtube(?:-nocookie)?\.com/embed/([^?&/]+)}))
+            "https://www.youtube.com/watch?v=#{match[1]}"
+        elsif (path = ipb_path(src))
+            url = discourse_url_for(path)
+            "#{Discourse.base_url}#{url}" if url
+        elsif src.match?(%r{\A(?:https?:)?//}i)
+            src.start_with?("//") ? "https:#{src}" : src
+        end
+    end
+
+    # Every IPB storage area ("<fileStore.core_Attachment>", "<fileStore.core_Emoticons>"...) is the uploads dir
+    def local_upload_path(url)
+        url = CGI.unescapeHTML(url.to_s).sub(/[?#].*\z/m, "")
+        relative =
+            if (match = url.match(%r{\A<fileStore\.\w+>/(.+)}))
+                match[1]
+            elsif (match = ipb_path(url)&.match(%r{\A/uploads/(.+)}))
+                match[1]
+            end
+
+        return unless relative
+
+        relative =
+            begin
+                URI.decode_uri_component(relative)
+            rescue ArgumentError
+                relative
+            end
+        File.join(UPLOADS_DIR, relative)
+    end
+
+    def upload_markdown(url, fileid, user_id)
+        attach_id = fileid.presence || url.to_s[/attachment\.php\?id=(\d+)/, 1]
+        upload, filename = (attach_id && upload_attachment(attach_id.to_i, user_id)) || upload_local_file(local_upload_path(url), user_id)
+        html_for_upload(upload, filename) if upload
+    end
+
+    # Files referenced by path get their original name from core_attachments when they are attachments,
+    # otherwise the IPB hash is stripped from the stored name ("image.png.<md5>.png" => "image.png")
+    def upload_local_file(path, user_id)
+        return unless path && File.exist?(path)
+
+        relative = path.delete_prefix("#{UPLOADS_DIR}/")
+        row = mysql_query("SELECT attach_id FROM #{TABLE_PREFIX}core_attachments WHERE attach_location = '#{@client.escape(relative)}' LIMIT 1").first
+        return upload_attachment(row["attach_id"], user_id) if row
+
+        filename = File.basename(path).sub(/\.\h{32}(?=\.\w+\z)/, "")
+        upload = create_upload(user_id, path, filename)
+        [upload, filename] if upload&.persisted?
+    rescue StandardError => e
+        puts "Error uploading #{path}: #{e.message}"
+        nil
     end
 
     def mysql_query(sql)
