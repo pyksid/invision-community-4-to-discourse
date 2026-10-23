@@ -25,6 +25,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     }
     REACTIONS_EXCLUDED_FROM_LIKE = %w[thinking cry -1 angry]
 
+    # Category holding IPB blog entries (one tag per blog, see blog_tags)
+    BLOG_CATEGORY_NAME = "Blogs"
+
     # Tag for every solved topic: topics flagged by the custom forums_topics.solved column have no answer post
     SOLVED_TAG = "résolu"
 
@@ -36,6 +39,10 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         '/^forums\/topic\//topic/',
         '/^forums\/forum\//forum/',
         '/^forums\/profile\//profile/',
+        '/^forums\/blogs\//blogs/',
+        '/^blogs\/entry\/\d+[^?]*\?.*\bcomment=(\d+).*/blog-comment/\1',
+        '/^blogs\/entry\/(\d+).*/blog-entry/\1',
+        '/^blogs\/blog\/(\d+).*/blog/\1',
         '/^topic\/\d+[^?]*\?.*\bcomment=(\d+).*/comment/\1',
         '/^topic\/(\d+).*/topic/\1',
         '/^forum\/(\d+).*/forum/\1',
@@ -64,6 +71,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_categories
         import_topics
         import_posts
+        import_blog_entries
+        import_blog_comments
         import_reactions
         import_tags
         import_solved
@@ -109,12 +118,14 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         (members_of_groups(group_ids.uniq) + member_ids).uniq
     end
 
-    # Members without posts, reactions or private messages are not imported, except staff
+    # Members without posts, blog entries/comments, reactions or private messages are not imported, except staff
     def active_member_condition(staff_ids)
         <<~SQL
             (EXISTS (SELECT 1 FROM #{TABLE_PREFIX}forums_posts fp WHERE fp.author_id = m.member_id)
             OR EXISTS (SELECT 1 FROM #{TABLE_PREFIX}core_reputation_index r WHERE r.member_id = m.member_id)
             OR EXISTS (SELECT 1 FROM #{TABLE_PREFIX}core_message_topic_user_map u WHERE u.map_user_id = m.member_id)
+            OR EXISTS (SELECT 1 FROM #{TABLE_PREFIX}blog_entries be WHERE be.entry_author_id = m.member_id)
+            OR EXISTS (SELECT 1 FROM #{TABLE_PREFIX}blog_comments bc WHERE bc.comment_member_id = m.member_id)
             OR m.member_id IN (#{(staff_ids + [0]).join(",")}))
         SQL
     end
@@ -421,6 +432,138 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
+    # IPB blogs are personal (one author each): entries become topics in BLOG_CATEGORY_NAME tagged with
+    # their blog's tag, comments become replies. Like forum topics, entries are imported open; drafts and
+    # hidden/unapproved entries (entry_hidden is the approval flag, 1 = visible) are skipped.
+    def import_blog_entries
+        puts "", "importing blog entries..."
+
+        category = create_category({ name: BLOG_CATEGORY_NAME }, "blogs")
+        tags = blog_tags
+
+        last_entry_id = -1
+        total_entries = mysql_count(<<~SQL)
+            SELECT COUNT(*) AS count
+            FROM #{TABLE_PREFIX}blog_entries
+            WHERE entry_status = 'published'
+            AND entry_hidden = 1
+        SQL
+
+        batches(BATCH_SIZE) do |offset|
+            entries = mysql_query(<<~SQL).to_a
+                SELECT entry_id AS id, entry_blog_id, entry_author_id, entry_name, entry_content, entry_cover_photo, entry_views,
+                    IF(entry_publish_date > 0, entry_publish_date, entry_date) AS published_at
+                FROM #{TABLE_PREFIX}blog_entries
+                WHERE entry_status = 'published'
+                AND entry_hidden = 1
+                AND entry_id > #{last_entry_id}
+                ORDER BY entry_id
+                LIMIT #{BATCH_SIZE}
+            SQL
+
+            break if entries.empty?
+
+            last_entry_id = entries[-1]["id"]
+
+            create_posts(entries, total: total_entries, offset: offset) do |e|
+                next if post_id_from_imported_post_id("b-#{e["id"]}")
+
+                user_id = user_id_from_imported_user_id(e["entry_author_id"])
+                if user_id.nil?
+                    puts "Skipping blog entry #{e["id"]} - User ID #{e["entry_author_id"]} not found"
+                    next
+                end
+
+                raw = clean_up(e["entry_content"], user_id)
+                cover = upload_markdown("<fileStore.blog_Entries>/#{e["entry_cover_photo"]}", nil, user_id) if e["entry_cover_photo"].present?
+                tag = tags[e["entry_blog_id"].to_i]
+
+                {
+                    id: "b-#{e["id"]}",
+                    title: CGI.unescapeHTML(e["entry_name"].encode("utf-8", "utf-8")),
+                    user_id: user_id,
+                    created_at: Time.zone.at(e["published_at"]),
+                    views: e["entry_views"],
+                    category: category.id,
+                    raw: cover ? "#{cover}\n\n#{raw}" : raw,
+                    post_create_action: proc { |post| DiscourseTagging.tag_topic_by_names(post.topic, staff_guardian, [tag], append: true) if tag },
+                }
+            end
+        end
+    end
+
+    def import_blog_comments
+        puts "", "importing blog comments..."
+
+        last_comment_id = -1
+        total_comments = mysql_count("SELECT COUNT(*) count FROM #{TABLE_PREFIX}blog_comments WHERE comment_approved = 1")
+
+        batches(BATCH_SIZE) do |offset|
+            comments = mysql_query(<<~SQL).to_a
+                SELECT comment_id AS id, comment_entry_id, comment_member_id, comment_date, comment_text
+                FROM #{TABLE_PREFIX}blog_comments
+                WHERE comment_approved = 1
+                AND comment_id > #{last_comment_id}
+                ORDER BY comment_id
+                LIMIT #{BATCH_SIZE}
+            SQL
+
+            break if comments.empty?
+
+            last_comment_id = comments[-1]["id"]
+
+            create_posts(comments, total: total_comments, offset: offset) do |c|
+                next if post_id_from_imported_post_id("bc-#{c["id"]}")
+
+                topic = topic_lookup_from_imported_post_id("b-#{c["comment_entry_id"]}")
+                next unless topic
+
+                user_id = user_id_from_imported_user_id(c["comment_member_id"])
+                if user_id.nil?
+                    puts "Skipping blog comment #{c["id"]} - User ID #{c["comment_member_id"]} not found"
+                    next
+                end
+
+                {
+                    id: "bc-#{c["id"]}",
+                    topic_id: topic[:topic_id],
+                    user_id: user_id,
+                    created_at: Time.zone.at(c["comment_date"]),
+                    raw: clean_up(c["comment_text"], user_id),
+                }
+            end
+        end
+    end
+
+    # blog_id => tag name "blog-<owner username>"; the tag description holds the blog's name
+    def blog_tags
+        @blog_tags ||= begin
+            SiteSetting.tagging_enabled = true
+            SiteSetting.max_tag_length = [SiteSetting.max_tag_length, 40].max
+
+            rows = mysql_query(<<~SQL).to_a
+                SELECT b.blog_id, b.blog_member_id, w.word_default AS name
+                FROM #{TABLE_PREFIX}blog_blogs b
+                LEFT JOIN #{TABLE_PREFIX}core_sys_lang_words w
+                    ON w.word_key = CONCAT('blogs_blog_', b.blog_id)
+                    AND w.lang_id = (SELECT lang_id FROM #{TABLE_PREFIX}core_sys_lang WHERE lang_default = 1)
+            SQL
+
+            rows.each_with_object({}) do |row, tags|
+                owner = User.find_by(id: user_id_from_imported_user_id(row["blog_member_id"]))
+                next unless owner
+
+                name = DiscourseTagging.clean_tag("blog-#{owner.username.parameterize}")
+                tag = Tag.find_or_create_by!(name: name)
+                description = row["name"].to_s.encode("utf-8", "utf-8", invalid: :replace, undef: :replace, replace: "")
+                tag.update!(description: description[0, 280]) if description.present?
+                tags[row["blog_id"].to_i] = name
+            rescue StandardError => e
+                puts "Error creating tag for blog #{row["blog_id"]}: #{e.message}"
+            end
+        end
+    end
+
     def configure_reactions
         SiteSetting.discourse_reactions_enabled = true
         SiteSetting.discourse_reactions_reaction_for_like = "heart"
@@ -443,10 +586,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         batches(BATCH_SIZE) do |offset|
             reactions = mysql_query(<<~SQL).to_a
-                SELECT id, member_id AS user_id, type_id AS post_id, rep_date AS created_at, reaction
+                SELECT id, type, member_id AS user_id, type_id AS post_id, rep_date AS created_at, reaction
                 FROM #{TABLE_PREFIX}core_reputation_index
-                WHERE app = 'forums'
-                AND type = 'pid'
+                WHERE ((app = 'forums' AND type = 'pid') OR (app = 'blog' AND type IN ('entry_id', 'comment_id')))
                 AND id > #{last_id}
                 ORDER BY id
                 LIMIT #{BATCH_SIZE}
@@ -463,7 +605,13 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 user = User.find_by(id: user_id_from_imported_user_id(r["user_id"]))
                 next unless user
 
-                post = Post.find_by(id: post_id_from_imported_pid(r["post_id"]))
+                post_id =
+                    case r["type"]
+                    when "pid" then post_id_from_imported_pid(r["post_id"])
+                    when "entry_id" then post_id_from_imported_post_id("b-#{r["post_id"]}")
+                    else post_id_from_imported_post_id("bc-#{r["post_id"]}")
+                    end
+                post = Post.find_by(id: post_id)
                 next unless post
 
                 created_at = Time.zone.at(r["created_at"])
@@ -589,7 +737,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
-    # Followed topics/forums: Discourse has no per-topic digest, so any notifying follow (immediate,
+    # Followed topics/forums (and blog entries/blogs, as topics/blog tags): Discourse has no per-topic digest, so any notifying follow (immediate,
     # daily, weekly) becomes "watching" and a follow without notifications becomes "tracking".
     # Member follows have no core equivalent and are skipped.
     def import_follows
@@ -598,8 +746,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         follows = mysql_query(<<~SQL).to_a
             SELECT follow_area, follow_rel_id, follow_member_id, follow_notify_do, follow_notify_freq
             FROM #{TABLE_PREFIX}core_follow
-            WHERE follow_app = 'forums'
-            AND follow_area IN ('topic', 'forum')
+            WHERE (follow_app = 'forums' AND follow_area IN ('topic', 'forum'))
+            OR (follow_app = 'blog' AND follow_area IN ('entry', 'blog'))
         SQL
 
         puts "Subscriptions to be processed: #{follows.size}"
@@ -611,12 +759,19 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             notify = f["follow_notify_do"] == 1 && f["follow_notify_freq"] != "none"
 
             begin
-                if f["follow_area"] == "topic"
-                    lookup = topic_lookup_from_imported_post_id("t-#{f["follow_rel_id"]}")
+                case f["follow_area"]
+                when "topic", "entry"
+                    prefix = f["follow_area"] == "topic" ? "t" : "b"
+                    lookup = topic_lookup_from_imported_post_id("#{prefix}-#{f["follow_rel_id"]}")
                     next unless lookup
 
                     level = TopicUser.notification_levels[notify ? :watching : :tracking]
                     TopicUser.change(user.id, lookup[:topic_id], notification_level: level)
+                when "blog"
+                    tag = Tag.find_by(name: blog_tags[f["follow_rel_id"].to_i])
+                    next unless tag
+
+                    TagUser.change(user.id, tag.id, TagUser.notification_levels[notify ? :watching : :tracking])
                 else
                     category_id = category_id_from_imported_category_id(f["follow_rel_id"])
                     next unless category_id
@@ -772,8 +927,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
-    # Old IPB URLs are reduced by PERMALINK_NORMALIZATIONS to "topic/<tid>", "comment/<pid>",
-    # "forum/<id>" and "profile/<member_id>", which point to the imported records
+    # Old IPB URLs are reduced by PERMALINK_NORMALIZATIONS to "topic/<tid>", "comment/<pid>", "forum/<id>",
+    # "profile/<member_id>", "blog-entry/<id>", "blog-comment/<id>" and "blog/<id>", which point to the imported records
     def create_permalinks
         puts "", "creating permalinks..."
 
@@ -801,11 +956,20 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     rows << { url: "comment/#{first_post_ids[tid.to_i]}", post_id: post_id } if first_post_ids[tid.to_i]
                 elsif id.match?(/\A\d+\z/)
                     rows << { url: "comment/#{id}", post_id: post_id }
+                elsif (entry_id = id[/\Ab-(\d+)\z/, 1])
+                    rows << { url: "blog-entry/#{entry_id}", topic_id: topic_id }
+                elsif (comment_id = id[/\Abc-(\d+)\z/, 1])
+                    rows << { url: "blog-comment/#{comment_id}", post_id: post_id }
                 end
             end
 
+        blog_tags.each do |blog_id, name|
+            tag = Tag.find_by(name: name)
+            rows << { url: "blog/#{blog_id}", tag_id: tag.id } if tag
+        end
+
         # insert_all needs the same keys on every row; it skips URLs that already have a permalink
-        blank = { topic_id: nil, post_id: nil, category_id: nil, user_id: nil }
+        blank = { topic_id: nil, post_id: nil, category_id: nil, user_id: nil, tag_id: nil }
         rows.each_slice(BATCH_SIZE) { |slice| Permalink.insert_all(slice.map { |row| blank.merge(row) }) }
         puts "#{rows.size} permalinks processed"
     end
@@ -898,7 +1062,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             path = ipb_path(a["href"])
             next unless path || a["href"].start_with?("<")
 
-            url = path && (discourse_url_for(path) || (path if path.match?(%r{\A/(?:topic|forum|profile)/\d+})))
+            url = path && (discourse_url_for(path) || (path if path.match?(%r{\A/(?:topic|forum|profile|blogs/entry|blogs/blog)/\d+})))
             if url
                 a["href"] = url
             else
@@ -924,10 +1088,14 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     end
 
     def quote_header(bq)
-        if bq["data-ipsquote-contentclass"] == "forums_Topic"
-            post = Post.find_by(id: post_id_from_imported_pid(bq["data-ipsquote-contentcommentid"]))
-            return "#{post.user.username}, post:#{post.post_number}, topic:#{post.topic_id}" if post&.user
-        end
+        comment_id = bq["data-ipsquote-contentcommentid"]
+        post_id =
+            case bq["data-ipsquote-contentclass"]
+            when "forums_Topic" then post_id_from_imported_pid(comment_id)
+            when "blog_Entry" then post_id_from_imported_post_id("bc-#{comment_id}")
+            end
+        post = Post.find_by(id: post_id) if post_id
+        return "#{post.user.username}, post:#{post.post_number}, topic:#{post.topic_id}" if post&.user
 
         user = User.find_by(id: user_id_from_imported_user_id(bq["data-ipsquote-userid"]))
         (user&.username || bq["data-ipsquote-username"].to_s).delete('"')
@@ -980,7 +1148,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             end
         return unless path
 
-        "/#{path.delete_prefix("/").delete_prefix("index.php?").delete_prefix("/")}".sub(%r{\A/forums/(?=(?:topic|forum|profile)/)}, "/")
+        "/#{path.delete_prefix("/").delete_prefix("index.php?").delete_prefix("/")}".sub(%r{\A/forums/(?=(?:topic|forum|profile|blogs)/)}, "/")
     end
 
     def discourse_url_for(path)
@@ -995,6 +1163,16 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             Category.find_by(id: category_id_from_imported_category_id(forum_id))&.url
         elsif (member_id = path[%r{\A/profile/(\d+)}, 1])
             User.find_by(id: user_id_from_imported_user_id(member_id))&.relative_url
+        elsif (entry_id = path[%r{\A/blogs/entry/(\d+)}, 1])
+            comment_id = path[/[?&#]comment[=-](\d+)/, 1]
+            post = Post.find_by(id: post_id_from_imported_post_id("bc-#{comment_id}")) if comment_id
+            return post.url if post
+
+            topic = topic_lookup_from_imported_post_id("b-#{entry_id}")
+            Topic.find_by(id: topic[:topic_id])&.relative_url if topic
+        elsif (blog_id = path[%r{\A/blogs/blog/(\d+)}, 1])
+            tag = blog_tags[blog_id.to_i]
+            "/tag/#{tag}" if tag
         end
     end
 
