@@ -27,7 +27,7 @@ DB_HOST=localhost DB_USER=root DB_PW=... DB_NAME=... TABLE_PREFIX=ips_ \
 
 ## Architecture
 
-`execute` runs the phases in a fixed order; later phases depend on ID mappings created by earlier ones: users → categories → topics → posts → reactions → tags → solved → articles → private messages → message replies → permalinks.
+`execute` runs the phases in a fixed order; later phases depend on ID mappings created by earlier ones: users → categories → topics → posts → reactions → tags → solved → follows → articles → private messages → message replies → permalinks.
 
 - **Imported-ID conventions**: topic first posts are `"t-<tid>"`, articles are `"a-<id>"`, replies use the raw IPB `pid`, private conversations are `"pm-t-<mt_id>"` and their replies `"pm-<msg_id>"`. Anything holding a raw IPB pid (likes' `type_id`, quotes' `data-cid`) must resolve it with `post_id_from_imported_pid`, which falls back to `"t-<tid>"` for opening posts; `post_id_from_imported_post_id` alone only matches replies. For topic ids use `topic_lookup_from_imported_post_id("t-<tid>")[:topic_id]`, not the first post's id.
 - **Pagination** is keyset-based (`WHERE id > last_id ORDER BY id LIMIT BATCH_SIZE`) inside `batches`, with `offset` only used for progress reporting.
@@ -45,6 +45,7 @@ DB_HOST=localhost DB_USER=root DB_PW=... DB_NAME=... TABLE_PREFIX=ips_ \
   - iframes → oneboxable URLs on their own line (`embed_url`);
   - internal links (`ipb_path`) → the Discourse URL (`discourse_url_for`), or the IPB `/topic|forum|profile/<id>` path for a permalink to redirect; other `<___base_url___>` links are unwrapped.
 - **Files**: every IPB storage area (`<fileStore.core_Attachment>`, `<fileStore.core_Emoticons>`…) maps to `UPLOADS_DIR` (single `FileSystem` storage). Attachments are uploaded from their hashed `attach_location` path with the original `attach_file` name passed separately (`upload_attachment`); Discourse takes the extension from that name. Files in `UPLOADS_DIR` are never modified.
+- **Follows**: forum/topic follows (`core_follow`) become category/topic notification levels — `watching` when the follow notified (immediate, daily or weekly; Discourse has no per-topic digest), `tracking` otherwise. Member follows are skipped (no core equivalent).
 - **Solved topics**: two systems coexist. IPB's native one (`forums_topics.topic_answered_pid`, accepter in `core_solved_index`) becomes a discourse-solved accepted answer; a custom plugin flagged whole topics in an added `forums_topics.solved` column (mostly 2017–2020) with no answer post. Every solved topic gets `SOLVED_TAG`. Records are written directly (`SolvedTopic`, `TopicAnswer`, `UserAction`) rather than through `DiscourseSolved::AcceptAnswer`, to avoid notifications.
 - **Private messages**: drafts and deleted conversations are skipped; only participants with `map_user_active = 1` get access (IPB removes access when a member leaves); messages from deleted members are attributed to the system user.
 - **Permalinks**: `create_permalinks` stores `topic/<tid>`, `comment/<pid>`, `forum/<id>` and `profile/<member_id>` from the `import_id` custom fields, and `PERMALINK_NORMALIZATIONS` reduces incoming IPB URLs (slugs, `/forums/` prefix, `?do=findComment&comment=`) to those keys. Normalization rules are `|`-separated, so a rule must not contain `|`.

@@ -67,6 +67,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_reactions
         import_tags
         import_solved
+        import_follows
         import_articles
         import_private_messages
         import_private_message_replies
@@ -584,6 +585,47 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     raw: clean_up(t["post"], user_id),
                     closed: t["record_locked"] == 1
                 }
+            end
+        end
+    end
+
+    # Followed topics/forums: Discourse has no per-topic digest, so any notifying follow (immediate,
+    # daily, weekly) becomes "watching" and a follow without notifications becomes "tracking".
+    # Member follows have no core equivalent and are skipped.
+    def import_follows
+        puts "", "importing topic and forum subscriptions..."
+
+        follows = mysql_query(<<~SQL).to_a
+            SELECT follow_area, follow_rel_id, follow_member_id, follow_notify_do, follow_notify_freq
+            FROM #{TABLE_PREFIX}core_follow
+            WHERE follow_app = 'forums'
+            AND follow_area IN ('topic', 'forum')
+        SQL
+
+        puts "Subscriptions to be processed: #{follows.size}"
+
+        follows.each do |f|
+            user = User.find_by(id: user_id_from_imported_user_id(f["follow_member_id"]))
+            next unless user
+
+            notify = f["follow_notify_do"] == 1 && f["follow_notify_freq"] != "none"
+
+            begin
+                if f["follow_area"] == "topic"
+                    lookup = topic_lookup_from_imported_post_id("t-#{f["follow_rel_id"]}")
+                    next unless lookup
+
+                    level = TopicUser.notification_levels[notify ? :watching : :tracking]
+                    TopicUser.change(user.id, lookup[:topic_id], notification_level: level)
+                else
+                    category_id = category_id_from_imported_category_id(f["follow_rel_id"])
+                    next unless category_id
+
+                    level = CategoryUser.notification_levels[notify ? :watching : :tracking]
+                    CategoryUser.set_notification_level_for_category(user, level, category_id)
+                end
+            rescue StandardError => e
+                puts "Error importing subscription of member #{f["follow_member_id"]}: #{e.message}"
             end
         end
     end
