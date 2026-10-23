@@ -63,6 +63,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             end
         end
 
+        return member_admin_ids.uniq if group_admin_ids.empty?
+
         group_admin_users = mysql_query(<<~SQL)
             SELECT DISTINCT member_id FROM #{TABLE_PREFIX}core_members WHERE member_group_id IN (#{group_admin_ids.join(",")});
         SQL
@@ -75,7 +77,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         last_user_id = -1
         about_me_column = "field_11"
-        total_users = mysql_query("SELECT COUNT(*) count FROM #{TABLE_PREFIX}core_members").first["count"]
+        total_users = mysql_count("SELECT COUNT(*) count FROM #{TABLE_PREFIX}core_members")
         moderator_ids = fetch_forum_moderators
         admin_ids = fetch_admins
 
@@ -143,9 +145,14 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     bio_raw: clean_up(u["pp_about_me"]),
                     post_create_action:
                         proc do |new_user|
-                            if u["member_banned"] == 1
+                            ban = u["member_banned"].to_i
+                            if ban == -1
                                 new_user.update(suspended_at: DateTime.now, suspended_till: 100.years.from_now)
-                            elsif u["pp_main_photo"].present?
+                            elsif ban > Time.now.to_i
+                                new_user.update(suspended_at: DateTime.now, suspended_till: Time.zone.at(ban))
+                            end
+
+                            if u["pp_main_photo"].present?
                                 path = File.join(UPLOADS_DIR, u["pp_main_photo"])
                                 
                                 if File.exist?(path)
@@ -218,12 +225,11 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         puts "", "importing topics..."
     
         last_topic_id = -1
-        total_topics = mysql_query(<<~SQL).first["count"]
+        total_topics = mysql_count(<<~SQL)
             SELECT COUNT(*) AS count
             FROM #{TABLE_PREFIX}forums_topics t
             JOIN #{TABLE_PREFIX}forums_posts p ON t.tid = p.topic_id
-            WHERE t.topic_close_time = 0
-            AND p.pdelete_time = 0
+            WHERE p.pdelete_time = 0
             AND p.new_topic = 1
             AND t.approved = 1
             AND p.queued = 0
@@ -236,8 +242,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 SELECT t.tid AS id, t.title, t.state, t.starter_id, t.start_date, t.views, t.forum_id, t.pinned, p.post
                 FROM #{TABLE_PREFIX}forums_topics t
                 JOIN #{TABLE_PREFIX}forums_posts p ON t.tid = p.topic_id
-                WHERE t.topic_close_time = 0
-                AND p.pdelete_time = 0
+                WHERE p.pdelete_time = 0
                 AND p.new_topic = 1
                 AND t.approved = 1
                 AND p.queued = 0
@@ -279,7 +284,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         puts "", "importing posts..."
     
         last_post_id = -1
-        total_posts = mysql_query(<<~SQL).first["count"]
+        total_posts = mysql_count(<<~SQL)
             SELECT COUNT(*) AS count
             FROM #{TABLE_PREFIX}forums_posts
             WHERE new_topic = 0
@@ -343,6 +348,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 SELECT id, member_id AS user_id, type_id AS post_id, rep_date AS created_at
                 FROM #{TABLE_PREFIX}core_reputation_index
                 WHERE rep_rating = 1
+                AND app = 'forums'
+                AND type = 'pid'
                 AND id > #{last_id}
                 ORDER BY id
                 LIMIT #{BATCH_SIZE}
@@ -356,7 +363,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 user_id = user_id_from_imported_user_id(like["user_id"])
                 next unless user_id
 
-                post_id = post_id_from_imported_post_id(like["post_id"])
+                post_id = post_id_from_imported_pid(like["post_id"])
                 next unless post_id
 
                 user = User.find_by(id: user_id)
@@ -428,10 +435,10 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         puts "", "importing articles..."
     
         last_article_id = -1
-        total_articles = mysql_query(<<~SQL).first["count"]
+        total_articles = mysql_count(<<~SQL)
             SELECT COUNT(*) AS count
             FROM #{TABLE_PREFIX}cms_custom_database_1
-            WHERE record_locked = 0
+            WHERE record_approved = 1
         SQL
 
         puts "Total articles to be imported: #{total_articles}"
@@ -443,10 +450,10 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         batches(BATCH_SIZE) do |offset|
             articles = mysql_query(<<~SQL).to_a
-                SELECT primary_id_field AS id, field_1 AS title, member_id, record_publish_date, record_views AS views,
+                SELECT primary_id_field AS id, field_1 AS title, member_id, record_publish_date, record_views AS views, record_locked,
                 CONCAT(field_2, '<br><br><hr><br><br>', field_3) AS post
                 FROM #{TABLE_PREFIX}cms_custom_database_1
-                WHERE record_locked = 0
+                WHERE record_approved = 1
                 AND primary_id_field > #{last_article_id}
                 ORDER BY primary_id_field
                 LIMIT #{BATCH_SIZE}
@@ -474,7 +481,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     created_at: created_at,
                     views: t["views"],
                     category: articles_category_id,
-                    raw: clean_up(t["post"], user_id)
+                    raw: clean_up(t["post"], user_id),
+                    closed: t["record_locked"] == 1
                 }
             end
         end
@@ -502,7 +510,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         doc = Nokogiri::HTML5.fragment(raw)
 
         doc.css("blockquote.ipsBlockquote").each do |bq|
-          post_id = post_id_from_imported_post_id(bq["data-cid"])
+          post_id = post_id_from_imported_pid(bq["data-cid"])
           if post = Post.find_by(id: post_id)
             bq.replace %{<br>[quote="#{post.user.username},post:#{post.post_number},topic:#{post.topic_id}"]\n#{bq.inner_html}\n[/quote]<br>}
           end
@@ -514,75 +522,20 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             
             if href.start_with?("<___base_url___>/index.php?app=core&module=attach")
                 if (match_data = href.match(/attach_id=(\d+)/))
-                    attach_id = match_data[1].to_i
-                    result = mysql_query("SELECT attach_file, attach_location FROM #{TABLE_PREFIX}core_attachments WHERE attach_id = #{attach_id}").first
-        
-                    if result
-                        original_path = File.join(UPLOADS_DIR, result["attach_location"])
-                        directory = File.dirname(original_path)
-                        filename = result["attach_file"].encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
-
-                        extname = File.extname(result["attach_location"])
-                        basename = File.basename(result["attach_location"], extname)
-
-                        new_filename = filename if File.extname(filename).length > 1
-                        new_filename ||= "#{filename}#{extname}"
-                        new_path = File.join(directory, new_filename)
-
-                        if File.exist?(original_path) && !File.exist?(new_path)
-                            File.rename(original_path, new_path)
-                        end
-        
-                        if File.exist?(new_path)
-                            begin
-                                upload = create_upload(user_id, new_path, new_filename)
-                                if upload&.persisted?
-                                    new_url = html_for_upload(upload, new_filename)
-                                    if img
-                                        img.replace(new_url)
-                                        img.remove_attribute("data-src")
-                                        a.remove
-                                    else
-                                        a.replace("![#{new_filename}](#{new_url})")
-                                    end
-                                end
-                            rescue StandardError => e
-                                puts "Error processing attachment link: #{e.message}"
-                            end
+                    upload, filename = upload_attachment(match_data[1].to_i, user_id)
+                    if upload
+                        new_url = html_for_upload(upload, filename)
+                        if img
+                            img.replace(new_url)
+                            a.remove
+                        else
+                            a.replace(new_url)
                         end
                     end
                 end
-            elsif (match_data = a["href"]&.match(%r{/attachment\.php\?id=(\d+)}))
-                attach_id = match_data[1].to_i
-        
-                result = mysql_query("SELECT attach_file, attach_location FROM #{TABLE_PREFIX}core_attachments WHERE attach_id = #{attach_id}").first
-                if result
-                    original_path = File.join(UPLOADS_DIR, result["attach_location"])
-                    directory = File.dirname(original_path)
-                    filename = result["attach_file"].encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
-
-                    extname = File.extname(result["attach_location"])
-                    basename = File.basename(result["attach_location"], extname)
-
-                    new_filename = filename if File.extname(filename).length > 1
-                    new_filename ||= "#{filename}#{extname}"
-                    new_path = File.join(directory, new_filename)
-
-                    if File.exist?(original_path) && !File.exist?(new_path)
-                        File.rename(original_path, new_path)
-                    end
-
-                    if File.exist?(new_path)
-                        begin
-                            upload = create_upload(user_id, new_path, new_filename)
-                            if upload&.persisted?
-                                new_url = html_for_upload(upload, new_filename)
-                                a.replace(new_url)
-                            end
-                            rescue StandardError => e
-                        end
-                    end
-                end
+            elsif (match_data = href.match(%r{/attachment\.php\?id=(\d+)}))
+                upload, filename = upload_attachment(match_data[1].to_i, user_id)
+                a.replace(html_for_upload(upload, filename)) if upload
             elsif(a["href"].to_s.start_with?("<fileStore.core_Attachment>/"))
                 filename = File.basename(a["href"].to_s).encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
                 extracted_path = a["href"].to_s.sub("<fileStore.core_Attachment>/", "")
@@ -603,55 +556,36 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
 
         doc.css("img").each do |img|
-            img["src"] = img["data-src"]
+            img["src"] = img["data-src"] if img["data-src"].present?
             img.remove_attribute("data-src")
-            if img["src"]&.match(%r{/uploads/imageproxy/([^/]+)$})
-                filename = $1
-                path = File.join(UPLOADS_DIR, "imageproxy", filename)
+            src = img["src"].to_s
 
-                if File.exist?(path)
-                    begin
-                        upload = create_upload(user_id, path, filename)
-                        if upload&.persisted?
-                            image_url = html_for_upload(upload, filename)
-                            img.replace(image_url)
-                        end
-                    rescue StandardError => e
-                    end
+            path, filename =
+                if (match = src.match(%r{/uploads/imageproxy/([^/]+)$}))
+                    [File.join(UPLOADS_DIR, "imageproxy", match[1]), match[1]]
+                elsif src.start_with?("<fileStore.core_Attachment>/")
+                    extracted_path = src.sub("<fileStore.core_Attachment>/", "")
+                    [File.join(UPLOADS_DIR, extracted_path), File.basename(extracted_path)]
+                elsif (match = src.match(%r{^uploads/emoticons/(.+)$}))
+                    [File.join(UPLOADS_DIR, "emoticons", match[1]), match[1]]
                 end
-            elsif img["src"].to_s.start_with?("<fileStore.core_Attachment>/")
-                filename = File.basename(img["src"].to_s).encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
-                extracted_path = img["src"].to_s.sub("<fileStore.core_Attachment>/", "")
-                path = File.join(UPLOADS_DIR, extracted_path)
 
-                if File.exist?(path)
+            if path
+                upload =
                     begin
-                        upload = create_upload(user_id, path, filename)
-                        if upload&.persisted?
-                            image_url = html_for_upload(upload, filename)
-                            img.replace(image_url)
-                        end
+                        create_upload(user_id, path, filename) if File.exist?(path)
                     rescue StandardError => e
+                        puts "Error uploading image #{path}: #{e.message}"
+                        nil
                     end
-                end
-            elsif img["src"]&.match(%r{^uploads/emoticons/(.+)$})
-                filename = $1.encode("UTF-8", invalid: :replace, undef: :replace, replace: "")
-                path = File.join(UPLOADS_DIR, "emoticons", filename)
-        
-                if File.exist?(path)
-                    begin
-                        upload = create_upload(user_id, path, filename)
-                        if upload&.persisted?
-                            image_url = html_for_upload(upload, filename)
-                            img.replace(image_url)
-                        end
-                    rescue StandardError => e
-                        puts "Error processing emoticon upload: #{e.message}"
-                    end
+
+                if upload&.persisted?
+                    img.replace(html_for_upload(upload, filename))
                 else
-                    puts "File not found: #{path}"
+                    puts "File not found: #{path}" unless File.exist?(path)
+                    img.remove
                 end
-            else
+            elsif !src.match?(%r{\Ahttps?://}i)
                 img.remove
             end
         end
@@ -665,12 +599,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             elsif url.start_with?("https://www.youtube.com/embed/") or url.start_with?("https://www.youtube-nocookie.com/embed/")
                 youtube_id = url.match(%r{/embed/([^?]+)})[1]
                 embedded_url = "https://www.youtube.com/watch?v=#{youtube_id}"
-            elsif url.match(%r{/topic/(\d+)-.*\?do=embed})
-                topic_id = url.match(%r{/topic/(\d+)-.*\?do=embed})[1]
-                discourse_topic_id = post_id_from_imported_post_id("t-#{topic_id}")
-                if discourse_topic_id
-                    embedded_url = "#{Discourse.base_url}/t/topic/#{discourse_topic_id}"
-                end
+            elsif (match = url.match(%r{/topic/(\d+)-.*\?do=embed}))
+                topic = topic_lookup_from_imported_post_id("t-#{match[1]}")
+                embedded_url = "#{Discourse.base_url}/t/#{topic[:topic_id]}" if topic
             else
                 iframe.replace(url)
             end
@@ -704,6 +635,41 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         puts "MySQL Query Error: #{e.message}"
         []
         end
+    end
+
+    def mysql_count(sql)
+        mysql_query(sql).first&.[]("count").to_i
+    end
+
+    # Opening posts are imported as "t-<tid>", so a raw pid only matches replies
+    def post_id_from_imported_pid(pid)
+        post_id_from_imported_post_id(pid) ||
+            ((tid = first_post_topic_ids[pid.to_i]) && post_id_from_imported_post_id("t-#{tid}"))
+    end
+
+    def first_post_topic_ids
+        @first_post_topic_ids ||= mysql_query(<<~SQL).to_h { |row| [row["pid"].to_i, row["topic_id"].to_i] }
+            SELECT pid, topic_id FROM #{TABLE_PREFIX}forums_posts WHERE new_topic = 1
+        SQL
+    end
+
+    # Uploads the file in place: attach_location is a hashed name, so the original
+    # filename (with the stored extension if it has none) is passed separately
+    def upload_attachment(attach_id, user_id)
+        result = mysql_query("SELECT attach_file, attach_location FROM #{TABLE_PREFIX}core_attachments WHERE attach_id = #{attach_id}").first
+        return unless result
+
+        path = File.join(UPLOADS_DIR, result["attach_location"])
+        return unless File.exist?(path)
+
+        filename = result["attach_file"].encode("UTF-8", "UTF-8", invalid: :replace, undef: :replace, replace: "")
+        filename = "#{filename}#{File.extname(result["attach_location"])}" if File.extname(filename).length <= 1
+
+        upload = create_upload(user_id, path, filename)
+        [upload, filename] if upload&.persisted?
+    rescue StandardError => e
+        puts "Error uploading attachment #{attach_id}: #{e.message}"
+        nil
     end
 end
 
