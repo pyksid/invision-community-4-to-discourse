@@ -41,7 +41,7 @@ DB_HOST=localhost DB_USER=root DB_PW=... DB_NAME=... TABLE_PREFIX=ips_ \
 - **`clean_up(raw, user_id)`** converts IPB HTML to Markdown via Nokogiri then `ReverseMarkdown`, for forum posts and private messages alike. Discourse-specific output goes through `placeholder` so ReverseMarkdown neither escapes nor reflows it; anything inserted into the DOM that must survive verbatim (BBCode, `@username`, `:emoji:`, upload markdown, onebox URLs) has to use it. Conversions, in order:
   - `blockquote.ipsQuote` → `[quote="user, post:N, topic:T"]` (innermost first), `div.ipsSpoiler` → `[details="title"]`;
   - `a[data-mentionid]` → `@username`;
-  - emoticon images → the Discourse emoji of the same `:code:`, else a custom emoji created from the IPB image (`core_emoticons`), else the typed text (`;)`, `:P`…);
+  - emoticon images → the emoji mapped in `EMOTICON_EMOJIS` (by code) or `EMOTICON_SET_EMOJIS` (by IPB emoticon set name, `core_emoticon_group_<emo_set>`), else the Discourse emoji of the same `:code:`, else a custom emoji created from the IPB image (`core_emoticons`), else the typed text (`;)`, `:P`…). Mapped names must exist in the `discourse-emojis` gem; same-name matches can be wrong (`:cool:` is 🆒, `:tongue:` 👅), hence the explicit map;
   - `data-fileid` / `attachment.php?id=` / `<fileStore.*>` / `<___base_url___>/uploads/` files and `<video>` sources → uploads (`upload_markdown`); external `http(s)` images are kept, other local images are dropped;
   - iframes → oneboxable URLs on their own line (`embed_url`);
   - internal links (`ipb_path`) → the Discourse URL (`discourse_url_for`), or the IPB `/topic|forum|profile/<id>` path for a permalink to redirect; other `<___base_url___>` links are unwrapped.

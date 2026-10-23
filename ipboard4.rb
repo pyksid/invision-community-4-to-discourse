@@ -25,6 +25,130 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     }
     REACTIONS_EXCLUDED_FROM_LIKE = %w[thinking cry -1 angry]
 
+    # IPB emoticon set name => Discourse emoji used for every emoticon of the set without its own entry
+    EMOTICON_SET_EMOJIS = {
+        "Satisfait" => "relieved",
+        "Mort de rire" => "joy",
+        "En colère" => "angry",
+        "Surpris" => "open_mouth",
+        "Perplexe" => "thinking",
+        "Laudatif" => "+1",
+        "Triste" => "cry",
+        "Moqueur" => "smirk",
+    }
+
+    # IPB emoticon code => Discourse emoji; takes precedence over EMOTICON_SET_EMOJIS and over a
+    # Discourse emoji of the same name (":cool:" is 🆒 and ":tongue:" 👅 in Discourse).
+    # A value may list several emojis. Codes in neither table become custom emojis made from the IPB image.
+    EMOTICON_EMOJIS = {
+        # Crabe
+        ":c_wink:" => "wink",
+        ":c_satisfied:" => "relieved",
+        ":c_satisfied2:" => "blush",
+        ":c_embarrassed:" => "flushed",
+        ":c_angry:" => "angry",
+        ":c_crying:" => "sob",
+        ":c_sad:" => "disappointed",
+        ":c_happy:" => "smile",
+        ":c_lol:" => "laughing",
+        ":c_lol2:" => "joy",
+        ":c_coldsweat:" => "sweat_smile",
+        ":c_omad:" => "rage",
+        ":c_surprised:" => "open_mouth",
+        ":c_tongue:" => "stuck_out_tongue",
+        ":c_doubtfully:" => "face_with_raised_eyebrow",
+        ":c_pokerface:" => "neutral_face",
+        ":c_inlove:" => "heart_eyes",
+        ":c_sunglasses:" => "sunglasses",
+        ":c_angel:" => "innocent",
+        ":c_fear:" => "fearful",
+        ":c_evil:" => "smiling_imp",
+        ":c_magic:" => "magic_wand",
+        ":c_wtf:" => "exploding_head",
+        # Classique
+        ":rolleyes:" => "roll_eyes",
+        ":dry:" => "expressionless",
+        ":huh:" => "confused",
+        ":sad:" => "slightly_frowning_face",
+        ":wub:" => "heart_eyes",
+        ":cool:" => "sunglasses",
+        ":ohmy:" => "astonished",
+        ":wink:" => "wink",
+        ":angry:" => "angry",
+        ":blink:" => "flushed",
+        ":blush:" => "blush",
+        ":happy:" => "smile",
+        ":laugh:" => "laughing",
+        ":ph34r:" => "ninja",
+        ":sleep:" => "sleeping",
+        ":smile:" => "slightly_smiling_face",
+        ":wacko:" => "zany_face",
+        ":mellow:" => "neutral_face",
+        ":tongue:" => "stuck_out_tongue",
+        ":unsure:" => "confused",
+        ":biggrin:" => "grin",
+        # categorised sets: only where the set's emoji does not fit
+        ":fist-pump-baby:" => "muscle",
+        ":desk-flip-rage-guy:" => "rage",
+        ":macron-colere:" => "rage",
+        ":grumpy-cat:" => "pouting_cat",
+        ":scared-cat:" => "scream_cat",
+        ":omg:" => "scream",
+        ":sceptique:" => "face_with_raised_eyebrow",
+        ":chuck-norris:" => "muscle",
+        ":good-job:" => "clap",
+        ":risitas-pleure1:" => "sob",
+        ":risitas-pleure2:" => "sob",
+        ":risitas-pleure3:" => "sob",
+        ":jesus-lol:" => "laughing",
+        # Pot-pourri (chosen by the forum owner)
+        ":evil-plotting-raccoon:" => "smiling_face_with_horns",
+        ":drhouse:" => "person_facepalming",
+        ":bourdon-est-ce-que-tu-baises:" => "disguised_face",
+        ":risitas-no:" => "person_facepalming",
+        ":kermit:" => "frog",
+        ":maitre-capello:" => "ok_hand",
+        ":risitas-sueur:" => "sweat_smile",
+        ":frustrated-boromir:" => "person_facepalming",
+        ":jacquouille:" => "zany_face",
+        ":risitas-adios:" => "waving_hand",
+        ":macron-doute:" => "face_with_raised_eyebrow",
+        ":relax:" => "ok_hand",
+        ":relax2:" => "smiling_face_with_sunglasses",
+        ":imagination:" => %w[raising_hands rainbow],
+        ":sarkozy-sueur:" => "cold_face",
+        ":spongebob:" => "person_pouting",
+        ":leo-dancing:" => "man_dancing",
+        ":first-day-on-the-internet-kid:" => "nerd_face",
+        ":strausskahn2:" => "person_pouting",
+        ":oui-monsieur:" => "index_pointing_up",
+        ":risitas-euh1:" => "upside_down_face",
+        ":wtf:" => "person_facepalming",
+        ":allthethings:" => "raising_hands",
+        ":guy:" => "nerd_face",
+        ":good-guy-putin:" => "+1",
+        ":miyamoto:" => "person_gesturing_no",
+        ":obi-wan-kenobi:" => "face_with_raised_eyebrow",
+        ":michael-jackson-popcorn:" => "popcorn",
+        ":waiting-skeleton:" => "skull",
+        ":dj-pauly-d:" => "shaking_face",
+        ":joker:" => "raising_hands",
+        ":drevil:" => "smiling_face_with_horns",
+        ":balladur:" => "raised_hand",
+        ":money-money:" => "money_mouth_face",
+        ":say-that-again-i-dare-you:" => "punch",
+        ":spongegar:" => "angry",
+        ":spiderman-hospital:" => "sleepy_face",
+        ":left-exit-12-off-ramp:" => "end_arrow",
+        ":trump-bill-signing:" => "raising_hands",
+        ":sarkozy-fuck:" => "fu",
+        ":uncle-sam:" => "index_pointing_at_the_viewer",
+        ":vomi:" => "face_vomiting",
+        ":look-son:" => "eyes",
+        ":spiderman-computer-desk:" => "face_without_mouth",
+        ":shut-up-and-take-my-money-fry:" => "money_mouth_face",
+    }
+
     # Category holding IPB blog entries (one tag per blog, see blog_tags)
     BLOG_CATEGORY_NAME = "Blogs"
 
@@ -1101,14 +1225,29 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         (user&.username || bq["data-ipsquote-username"].to_s).delete('"')
     end
 
-    # ":name:" codes become the Discourse emoji of the same name, or a custom emoji created from
-    # the IPB image; other codes (";)", ":P"...) stay as typed and Discourse's shortcuts handle them
+    # Codes mapped in EMOTICON_EMOJIS / EMOTICON_SET_EMOJIS become that Discourse emoji; other ":name:"
+    # codes become the Discourse emoji of the same name, or a custom emoji created from the IPB image;
+    # remaining codes (";)", ":P"...) stay as typed and Discourse's shortcuts handle them
     def emoticon_text(alt)
+        emojis = Array(EMOTICON_EMOJIS[alt] || EMOTICON_SET_EMOJIS[emoticon_sets[alt]])
+        return emojis.map { |emoji| ":#{emoji}:" }.join if emojis.any? && emojis.all? { |emoji| Emoji.exists?(emoji) }
+
         name = alt[/\A:([\w+-]+):\z/, 1]&.downcase
         return alt unless name
         return ":#{name}:" if Emoji.exists?(name) || custom_emoji?(name, alt)
 
         alt
+    end
+
+    # IPB emoticon code => name of its set ("Crabe", "Mort de rire"...) in the default language
+    def emoticon_sets
+        @emoticon_sets ||= mysql_query(<<~SQL).to_h { |row| [row["typed"].encode("utf-8", "utf-8"), row["set_name"].to_s.encode("utf-8", "utf-8")] }
+            SELECT e.typed, w.word_default AS set_name
+            FROM #{TABLE_PREFIX}core_emoticons e
+            LEFT JOIN #{TABLE_PREFIX}core_sys_lang_words w
+                ON w.word_key = CONCAT('core_emoticon_group_', e.emo_set)
+                AND w.lang_id = (SELECT lang_id FROM #{TABLE_PREFIX}core_sys_lang WHERE lang_default = 1)
+        SQL
     end
 
     def custom_emoji?(name, typed)
