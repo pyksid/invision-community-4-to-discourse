@@ -204,6 +204,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_articles
         import_private_messages
         import_private_message_replies
+        import_ranks
         create_permalinks
     end
 
@@ -907,6 +908,82 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 puts "Error importing subscription of member #{f["follow_member_id"]}: #{e.message}"
             end
         end
+    end
+
+    # IPB rank names, icons and thresholds (core_member_ranks) become badges that a daily badge SQL query
+    # grants from the discourse-gamification score. IPB points and earned ranks are not imported: the score
+    # is computed by the plugin over the whole imported history, so ranks keep progressing after the
+    # migration. Titles stay a member's choice.
+    def import_ranks
+        puts "", "importing ranks..."
+
+        SiteSetting.discourse_gamification_enabled = true
+        SiteSetting.enable_badge_sql = true
+
+        leaderboard =
+            DiscourseGamification::GamificationLeaderboard.first ||
+                DiscourseGamification::GamificationLeaderboard.create!(name: "Classement", created_by_id: Discourse::SYSTEM_USER_ID)
+
+        ranks = mysql_query(<<~SQL).to_a
+            SELECT r.id, r.points, r.icon, TRIM(w.word_default) AS name
+            FROM #{TABLE_PREFIX}core_member_ranks r
+            JOIN #{TABLE_PREFIX}core_sys_lang_words w
+                ON w.word_key = CONCAT('core_member_rank_', r.id)
+                AND w.lang_id = (SELECT lang_id FROM #{TABLE_PREFIX}core_sys_lang WHERE lang_default = 1)
+            ORDER BY r.points
+        SQL
+
+        grouping = BadgeGrouping.find_or_create_by!(name: "Rangs") { |g| g.position = 10 }
+
+        badges =
+            ranks.filter_map do |rank|
+                name = rank["name"].encode("utf-8", "utf-8")
+                points = rank["points"].to_i
+
+                badge = Badge.find_or_initialize_by(name: name)
+                badge.assign_attributes(
+                    description: "Rang atteint à partir de #{points} points.",
+                    badge_type_id: points >= 10_000 ? BadgeType::Gold : points >= 1_000 ? BadgeType::Silver : BadgeType::Bronze,
+                    badge_grouping: grouping,
+                    allow_title: true,
+                    multiple_grant: false,
+                    listable: true,
+                    auto_revoke: false,
+                    enabled: true,
+                    trigger: Badge::Trigger::None,
+                    query: rank_badge_query(leaderboard.id, points),
+                    icon: "anchor",
+                )
+                badge.image_upload_id ||= rank_icon_upload(rank["icon"])&.id
+                badge.save!
+                badge
+            rescue StandardError => e
+                puts "Error creating badge for rank #{rank["id"]}: #{e.message}"
+                nil
+            end
+
+        first_post_at = Post.minimum(:created_at)&.to_date || Date.today
+        DiscourseGamification::GamificationLeaderboardScore.calculate_scores(leaderboard, since_date: leaderboard.from_date || first_post_at)
+        badges.each { |badge| BadgeGranter.backfill(badge) }
+    end
+
+    def rank_badge_query(leaderboard_id, points)
+        <<~SQL
+            SELECT s.user_id, MAX(s.date)::timestamp AS granted_at
+            FROM gamification_leaderboard_scores s
+            WHERE s.leaderboard_id = #{leaderboard_id}
+            GROUP BY s.user_id
+            HAVING SUM(s.score) >= #{points}
+        SQL
+    end
+
+    # Rank icons are SVG files in the uploads dir; the badge keeps its "anchor" icon if the upload is refused
+    def rank_icon_upload(icon)
+        path = icon.present? && File.join(UPLOADS_DIR, icon)
+        return unless path && File.exist?(path)
+
+        upload = create_upload(Discourse::SYSTEM_USER_ID, path, File.basename(path))
+        upload if upload&.persisted?
     end
 
     # Two solved systems coexist: IPB's native one (topic_answered_pid, with core_solved_index for who
