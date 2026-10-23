@@ -25,6 +25,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     }
     REACTIONS_EXCLUDED_FROM_LIKE = %w[thinking cry -1 angry]
 
+    # Tag for every solved topic: topics flagged by the custom forums_topics.solved column have no answer post
+    SOLVED_TAG = "résolu"
+
     # Hosts (and path prefix) the forum was served from, so absolute links to it are treated as internal
     OLD_BASE_URLS = %w[community.lecrabeinfo.net lecrabeinfo.net/forums]
 
@@ -63,6 +66,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_posts
         import_reactions
         import_tags
+        import_solved
         import_articles
         import_private_messages
         import_private_message_replies
@@ -244,7 +248,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         parent_categories = categories.select { |c| c["parent_id"] == -1 }
         child_categories = categories.select { |c| c["parent_id"] != -1 }
-    
+        staff_only = staff_only_forum_ids
+        restrict = proc { |id| proc { |category| restrict_to_staff(category) if staff_only.include?(id) } }
+
         create_categories(parent_categories) do |c|
         next if category_id_from_imported_category_id(c["id"])
         {
@@ -252,6 +258,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             name: c["category_name"].encode("utf-8", "utf-8"),
             description: clean_up(c["description"]),
             position: c["position"],
+            post_create_action: restrict.call(c["id"].to_i),
         }
         end
     
@@ -263,8 +270,39 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             name: c["category_name"].encode("utf-8", "utf-8"),
             description: clean_up(c["description"]),
             position: c["position"],
+            post_create_action: restrict.call(c["id"].to_i),
         }
         end
+    end
+
+    def staff_group_ids
+        rows = mysql_query(<<~SQL)
+            SELECT id FROM #{TABLE_PREFIX}core_moderators WHERE type = 'g'
+            UNION
+            SELECT row_id FROM #{TABLE_PREFIX}core_admin_permission_rows WHERE row_id_type = 'group'
+        SQL
+
+        (rows.map { |row| row["id"].to_i } + ADMIN_GROUP_IDS).uniq
+    end
+
+    # Forums whose view permission ("*" = everyone, otherwise group ids) lists only staff groups
+    def staff_only_forum_ids
+        staff_groups = staff_group_ids
+        rows = mysql_query(<<~SQL)
+            SELECT perm_type_id, perm_view FROM #{TABLE_PREFIX}core_permission_index
+            WHERE app = 'forums' AND perm_type = 'forum'
+        SQL
+
+        rows
+            .reject { |row| row["perm_view"] == "*" }
+            .select { |row| (row["perm_view"].to_s.split(",").map(&:to_i) - staff_groups).empty? }
+            .map { |row| row["perm_type_id"].to_i }
+    end
+
+    def restrict_to_staff(category)
+        category.set_permissions("staff" => :full)
+        category.save!
+        puts "Category #{category.name} restricted to staff"
     end
 
     def import_topics
@@ -546,6 +584,57 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     raw: clean_up(t["post"], user_id),
                     closed: t["record_locked"] == 1
                 }
+            end
+        end
+    end
+
+    # Two solved systems coexist: IPB's native one (topic_answered_pid, with core_solved_index for who
+    # accepted it) becomes a discourse-solved accepted answer, and a custom plugin that flagged the topic
+    # itself (forums_topics.solved). Every solved topic also gets SOLVED_TAG so one filter lists them all.
+    # Records are written directly instead of DiscourseSolved::AcceptAnswer to avoid notifications.
+    def import_solved
+        puts "", "importing solved topics..."
+
+        SiteSetting.solved_enabled = true
+        SiteSetting.allow_solved_on_all_topics = true
+        SiteSetting.tagging_enabled = true
+
+        rows = mysql_query(<<~SQL).to_a
+            SELECT t.tid, t.topic_answered_pid, MIN(s.member_id) AS accepter_id
+            FROM #{TABLE_PREFIX}forums_topics t
+            LEFT JOIN #{TABLE_PREFIX}core_solved_index s
+                ON s.app = 'forums' AND s.item_id = t.tid AND s.comment_id = t.topic_answered_pid
+            WHERE t.topic_answered_pid > 0 OR t.solved = 1
+            GROUP BY t.tid, t.topic_answered_pid
+        SQL
+
+        puts "Solved topics to be processed: #{rows.size}"
+
+        rows.each do |row|
+            lookup = topic_lookup_from_imported_post_id("t-#{row["tid"]}")
+            topic = lookup && Topic.find_by(id: lookup[:topic_id])
+            next unless topic
+
+            begin
+                DiscourseTagging.tag_topic_by_names(topic, staff_guardian, [SOLVED_TAG], append: true)
+
+                answer = Post.find_by(id: post_id_from_imported_pid(row["topic_answered_pid"])) if row["topic_answered_pid"].to_i > 0
+                next if !answer || answer.topic_id != topic.id || answer.post_number <= 1
+
+                solved_topic = DiscourseSolved::SolvedTopic.find_or_create_by!(topic: topic)
+                next if solved_topic.topic_answers.exists?
+
+                accepter = User.find_by(id: user_id_from_imported_user_id(row["accepter_id"])) || Discourse.system_user
+                DiscourseSolved::TopicAnswer.create!(solved_topic: solved_topic, post: answer, accepter: accepter)
+                UserAction.log_action!(
+                    action_type: UserAction::SOLVED,
+                    user_id: answer.user_id,
+                    acting_user_id: accepter.id,
+                    target_post_id: answer.id,
+                    target_topic_id: topic.id,
+                )
+            rescue StandardError => e
+                puts "Error importing solved state of topic #{row["tid"]}: #{e.message}"
             end
         end
     end
