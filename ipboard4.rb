@@ -9,6 +9,22 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     UPLOADS_DIR = "/path/to/uploads"
     TABLE_PREFIX = ENV["TABLE_PREFIX"] || "ipb_"
 
+    # IPB groups whose members become Discourse admins; other groups with ACP access become moderators
+    ADMIN_GROUP_IDS = [4]
+
+    # IPB reaction id => Discourse emoji (discourse-reactions plugin); "heart" is the Discourse like
+    REACTION_EMOJIS = {
+        1 => "heart",      # J'aime
+        2 => "heart_eyes", # J'adore
+        3 => "laughing",   # Ahah
+        4 => "thinking",   # Perplexe
+        5 => "cry",        # Triste
+        6 => "+1",         # Plusser (+1)
+        7 => "-1",         # Moinsser (-1)
+        9 => "angry",      # Grrr
+    }
+    REACTIONS_EXCLUDED_FROM_LIKE = %w[thinking cry -1 angry]
+
     SiteSetting.disable_emails = "non-staff"
     SiteSetting.disable_digest_emails = true
 
@@ -31,55 +47,65 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_categories
         import_topics
         import_posts
-        import_likes
+        import_reactions
         import_tags
         import_articles
     end
 
-    def fetch_forum_moderators
-        forum_moderators = mysql_query(<<~SQL)
-            SELECT DISTINCT m.member_id
-            FROM #{TABLE_PREFIX}core_members m
-            LEFT JOIN #{TABLE_PREFIX}core_moderators modee ON m.member_id = modee.id
-            WHERE modee.type = 'm';
+    # Primary and secondary (mgroup_others) group memberships
+    def members_of_groups(group_ids)
+        return [] if group_ids.empty?
+
+        rows = mysql_query(<<~SQL)
+            SELECT member_id FROM #{TABLE_PREFIX}core_members
+            WHERE member_group_id IN (#{group_ids.join(",")})
+            OR mgroup_others REGEXP '(^|,)(#{group_ids.join("|")})(,|$)'
         SQL
 
-        forum_moderators.map { |row| row["member_id"].to_i }
+        rows.map { |row| row["member_id"].to_i }
     end
 
     def fetch_admins
-        admin_rows = mysql_query(<<~SQL).to_a
-            SELECT row_id, row_id_type FROM #{TABLE_PREFIX}core_admin_permission_rows;
+        member_rows = mysql_query(<<~SQL)
+            SELECT row_id FROM #{TABLE_PREFIX}core_admin_permission_rows WHERE row_id_type = 'member'
         SQL
 
-        group_admin_ids = []
-        member_admin_ids = []
+        (members_of_groups(ADMIN_GROUP_IDS) + member_rows.map { |row| row["row_id"].to_i }).uniq
+    end
 
-        admin_rows.each do |row|
-            if row["row_id_type"] == "group"
-                group_admin_ids << row["row_id"].to_i
-            elsif row["row_id_type"] == "member"
-                member_admin_ids << row["row_id"].to_i
-            end
-        end
-
-        return member_admin_ids.uniq if group_admin_ids.empty?
-
-        group_admin_users = mysql_query(<<~SQL)
-            SELECT DISTINCT member_id FROM #{TABLE_PREFIX}core_members WHERE member_group_id IN (#{group_admin_ids.join(",")});
+    # Moderator groups/members, plus groups with ACP access that are not in ADMIN_GROUP_IDS
+    def fetch_moderators
+        rows = mysql_query(<<~SQL).to_a
+            SELECT type, id FROM #{TABLE_PREFIX}core_moderators
+            UNION ALL
+            SELECT 'g', row_id FROM #{TABLE_PREFIX}core_admin_permission_rows WHERE row_id_type = 'group'
         SQL
 
-        (group_admin_users.map { |row| row["member_id"].to_i } + member_admin_ids).uniq
+        group_ids = rows.select { |row| row["type"] == "g" }.map { |row| row["id"].to_i } - ADMIN_GROUP_IDS
+        member_ids = rows.select { |row| row["type"] == "m" }.map { |row| row["id"].to_i }
+
+        (members_of_groups(group_ids.uniq) + member_ids).uniq
+    end
+
+    # Members without posts, reactions or private messages are not imported, except staff
+    def active_member_condition(staff_ids)
+        <<~SQL
+            (EXISTS (SELECT 1 FROM #{TABLE_PREFIX}forums_posts fp WHERE fp.author_id = m.member_id)
+            OR EXISTS (SELECT 1 FROM #{TABLE_PREFIX}core_reputation_index r WHERE r.member_id = m.member_id)
+            OR EXISTS (SELECT 1 FROM #{TABLE_PREFIX}core_message_topic_user_map u WHERE u.map_user_id = m.member_id)
+            OR m.member_id IN (#{(staff_ids + [0]).join(",")}))
+        SQL
     end
 
     def import_users
         puts "", "importing users..."
 
         last_user_id = -1
-        about_me_column = "field_11"
-        total_users = mysql_count("SELECT COUNT(*) count FROM #{TABLE_PREFIX}core_members")
-        moderator_ids = fetch_forum_moderators
+        about_me_column = "field_1"
         admin_ids = fetch_admins
+        moderator_ids = fetch_moderators - admin_ids
+        active_members = active_member_condition(admin_ids + moderator_ids)
+        total_users = mysql_count("SELECT COUNT(*) count FROM #{TABLE_PREFIX}core_members m WHERE #{active_members}")
 
         batches(BATCH_SIZE) do |offset|
             users = mysql_query(<<~SQL).to_a
@@ -104,6 +130,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 FROM #{TABLE_PREFIX}core_members AS m
                 LEFT JOIN #{TABLE_PREFIX}core_pfields_content AS p ON m.member_id = p.member_id
                 WHERE m.member_id > #{last_user_id}
+                AND #{active_members}
                 ORDER BY m.member_id
                 LIMIT #{BATCH_SIZE}
             SQL
@@ -187,10 +214,12 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 parent_lang.word_default AS category_name,
                 desc_lang.word_default AS description
             FROM #{TABLE_PREFIX}forums_forums f
-            JOIN #{TABLE_PREFIX}core_sys_lang_words parent_lang 
+            JOIN #{TABLE_PREFIX}core_sys_lang_words parent_lang
                 ON parent_lang.word_key = CONCAT('forums_forum_', f.id)
-            JOIN #{TABLE_PREFIX}core_sys_lang_words desc_lang 
+                AND parent_lang.lang_id = (SELECT lang_id FROM #{TABLE_PREFIX}core_sys_lang WHERE lang_default = 1)
+            LEFT JOIN #{TABLE_PREFIX}core_sys_lang_words desc_lang
                 ON desc_lang.word_key = CONCAT('forums_forum_', f.id, '_desc')
+                AND desc_lang.lang_id = parent_lang.lang_id
             LEFT JOIN #{TABLE_PREFIX}forums_forums p
                 ON f.parent_id = p.id
             WHERE f.parent_id != -1
@@ -274,7 +303,6 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     category: category_id_from_imported_category_id(t["forum_id"]),
                     pinned_at: t["pinned"] == 1 ? created_at : nil,
                     raw: clean_up(t["post"], user_id),
-                    closed: t["state"] != "open"
                 }
             end
         end
@@ -337,48 +365,65 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
-    def import_likes
-        puts "", "importing post likes"
-    
+    def configure_reactions
+        SiteSetting.discourse_reactions_enabled = true
+        SiteSetting.discourse_reactions_reaction_for_like = "heart"
+
+        emojis = REACTION_EMOJIS.values - ["heart"]
+        SiteSetting.discourse_reactions_enabled_reactions =
+            (SiteSetting.discourse_reactions_enabled_reactions.split("|") | emojis).join("|")
+        SiteSetting.discourse_reactions_excluded_from_like =
+            (SiteSetting.discourse_reactions_excluded_from_like.split("|") | REACTIONS_EXCLUDED_FROM_LIKE).join("|")
+    end
+
+    # Mirrors DiscourseReactions::ReactionManager without notifications: the main reaction is a
+    # plain like, other reactions get a ReactionUser plus a like unless excluded from likes
+    def import_reactions
+        puts "", "importing post reactions"
+
+        configure_reactions
         last_id = -1
         RateLimiter.disable
 
         batches(BATCH_SIZE) do |offset|
-            likes = mysql_query(<<-SQL).to_a
-                SELECT id, member_id AS user_id, type_id AS post_id, rep_date AS created_at
+            reactions = mysql_query(<<~SQL).to_a
+                SELECT id, member_id AS user_id, type_id AS post_id, rep_date AS created_at, reaction
                 FROM #{TABLE_PREFIX}core_reputation_index
-                WHERE rep_rating = 1
-                AND app = 'forums'
+                WHERE app = 'forums'
                 AND type = 'pid'
                 AND id > #{last_id}
                 ORDER BY id
                 LIMIT #{BATCH_SIZE}
             SQL
 
-            break if likes.empty?
+            break if reactions.empty?
 
-            last_id = likes[-1]["id"]
-        
-            likes.each do |like|
-                user_id = user_id_from_imported_user_id(like["user_id"])
-                next unless user_id
+            last_id = reactions[-1]["id"]
 
-                post_id = post_id_from_imported_pid(like["post_id"])
-                next unless post_id
+            reactions.each do |r|
+                emoji = REACTION_EMOJIS[r["reaction"].to_i]
+                next unless emoji
 
-                user = User.find_by(id: user_id)
+                user = User.find_by(id: user_id_from_imported_user_id(r["user_id"]))
                 next unless user
 
-                post = Post.find_by(id: post_id)
+                post = Post.find_by(id: post_id_from_imported_pid(r["post_id"]))
                 next unless post
 
-                next if PostAction.exists?(user_id: user_id, post_id: post_id, post_action_type_id: 2)
+                created_at = Time.zone.at(r["created_at"])
+                liked = PostAction.exists?(user_id: user.id, post_id: post.id, post_action_type_id: PostActionType::LIKE_POST_ACTION_ID)
 
                 begin
-                    PostActionCreator.like(user,post)
+                    if emoji != "heart" && !DiscourseReactions::ReactionUser.exists?(user_id: user.id, post_id: post.id)
+                        reaction = DiscourseReactions::Reaction.find_or_create_by!(post_id: post.id, reaction_type: :emoji, reaction_value: emoji)
+                        DiscourseReactions::ReactionUser.create!(reaction: reaction, user_id: user.id, post_id: post.id, created_at: created_at)
+                    end
 
+                    if !liked && !REACTIONS_EXCLUDED_FROM_LIKE.include?(emoji)
+                        PostActionCreator.create(user, post, :like, created_at: created_at, silent: true)
+                    end
                 rescue StandardError => e
-                    puts "Error importing like for post #{like["post_id"]} by user #{like["user_id"]}: #{e.message}"
+                    puts "Error importing reaction #{r["id"]} on post #{r["post_id"]}: #{e.message}"
                 end
             end
         end
