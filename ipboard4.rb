@@ -306,6 +306,14 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 end
                 next if u["name"].blank? || !Email.is_valid?(u["email"])
 
+                # With normalize_emails, Discourse treats addresses that differ only by dots or a "+suffix" as
+                # one; such duplicate IPB accounts (re-registrations) are merged into the account imported first
+                if (existing = UserEmail.find_by_normalized(u["email"])&.user)
+                    add_user(u["id"].to_s, existing)
+                    puts "", "Merged IPB member #{u["id"]} into #{existing.username} (same normalized email)"
+                    next
+                end
+
                 is_moderator = moderator_ids.include?(u["id"].to_i)
                 is_admin = admin_ids.include?(u["id"].to_i)
 
