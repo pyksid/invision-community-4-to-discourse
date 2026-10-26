@@ -11,6 +11,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     # IPB groups whose members become Discourse admins; other groups with ACP access become moderators
     ADMIN_GROUP_IDS = [4]
+    # Members (except staff) not seen for this many days get an archived account, see archive_inactive_users
+    ARCHIVE_INACTIVE_AFTER_DAYS = 365
     # IPB group id => Discourse group name (letters, digits, "_", 20 chars max); the IPB group name becomes the
     # group's full name and title. Other IPB groups (members, guests, admins…) are not imported as groups.
     GROUPS = { 6 => "moderateurs", 7 => "super_moderateurs", 8 => "helpers_securite" }
@@ -221,6 +223,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     def execute
         import_users
+        archive_inactive_users
         import_groups
         import_ignored_users
         import_avatars
@@ -339,7 +342,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             print_status(index + 1, members.size, start_time)
 
             user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
-            next if !user || user.has_password? || user.custom_fields["import_pass"].present?
+            next if !user || user.has_password? || user.custom_fields["import_pass"].present? || archived?(user)
 
             user.custom_fields["import_pass"] = m["members_pass_hash"].encode("utf-8", "utf-8")
             user.save_custom_fields
@@ -369,7 +372,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             print_status(index + 1, members.size, start_time)
 
             user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
-            next unless user
+            next if !user || archived?(user)
 
             values = columns.to_h { |column| [column, CGI.unescapeHTML(m[column].to_s.encode("utf-8", "utf-8", invalid: :replace, undef: :replace, replace: "")).strip] }
 
@@ -412,6 +415,54 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             field.position = UserField.maximum(:position).to_i + 1
             definition[:options]&.each { |option| field.user_field_options.build(value: option) }
         end
+    end
+
+    # Members not seen for ARCHIVE_INACTIVE_AFTER_DAYS keep their username, avatar, cover photo and content (so
+    # authorship, quotes, mentions and profile links survive) but no personal data: the email is replaced with an
+    # unreachable address and IP addresses, birthday, password hash, location and user fields are dropped. They never
+    # get emails; a returning member asks staff to set their email. Runs on already imported users too.
+    def archive_inactive_users
+        puts "", "archiving inactive users..."
+
+        staff_ids = fetch_admins + fetch_moderators
+        members = mysql_query(<<~SQL).to_a
+            SELECT member_id AS id
+            FROM #{TABLE_PREFIX}core_members
+            WHERE last_activity < #{ARCHIVE_INACTIVE_AFTER_DAYS.days.ago.to_i}
+            AND member_id NOT IN (#{(staff_ids + [0]).join(",")})
+        SQL
+        archived = 0
+        start_time = Time.now
+
+        members.each_with_index do |m, index|
+            print_status(index + 1, members.size, start_time)
+
+            user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
+            next if !user || archived?(user)
+
+            User.transaction do
+                user.primary_email.update!(email: "archived#{m["id"]}@archived.invalid")
+                user.update_columns(ip_address: nil, registration_ip_address: nil, date_of_birth: nil)
+                UserIpAddressHistory.where(user_id: user.id).delete_all
+                user.user_profile.update_column(:location, nil)
+                user.user_option.update!(
+                    email_digests: false,
+                    email_level: UserOption.email_level_types[:never],
+                    email_messages_level: UserOption.email_level_types[:never],
+                )
+                UserCustomField.where(user_id: user.id).where("name = 'import_pass' OR name LIKE ?", "#{User::USER_FIELD_PREFIX}%").delete_all
+                UserCustomField.create!(user_id: user.id, name: "import_archived", value: "t")
+            end
+            archived += 1
+        rescue StandardError => e
+            puts "", "Failed to archive member #{m["id"]}: #{e.message}"
+        end
+
+        puts "", "#{archived} inactive users archived"
+    end
+
+    def archived?(user)
+        UserCustomField.exists?(user_id: user.id, name: "import_archived")
     end
 
     # Public groups for the IPB groups in GROUPS, with their primary and secondary members
