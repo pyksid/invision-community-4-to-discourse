@@ -700,11 +700,15 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         last_id = -1
         RateLimiter.disable
 
+        reaction_condition = "((app = 'forums' AND type = 'pid') OR (app = 'blog' AND type IN ('entry_id', 'comment_id')))"
+        total_reactions = mysql_count("SELECT COUNT(*) count FROM #{TABLE_PREFIX}core_reputation_index WHERE #{reaction_condition}")
+        start_time = Time.now
+
         batches(BATCH_SIZE) do |offset|
             reactions = mysql_query(<<~SQL).to_a
                 SELECT id, type, member_id AS user_id, type_id AS post_id, rep_date AS created_at, reaction
                 FROM #{TABLE_PREFIX}core_reputation_index
-                WHERE ((app = 'forums' AND type = 'pid') OR (app = 'blog' AND type IN ('entry_id', 'comment_id')))
+                WHERE #{reaction_condition}
                 AND id > #{last_id}
                 ORDER BY id
                 LIMIT #{BATCH_SIZE}
@@ -746,6 +750,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     puts "Error importing reaction #{r["id"]} on post #{r["post_id"]}: #{e.message}"
                 end
             end
+
+            print_status(offset + reactions.size, total_reactions, start_time)
         end
         RateLimiter.enable
     end
