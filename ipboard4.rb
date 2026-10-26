@@ -988,11 +988,12 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         badges =
             ranks.filter_map do |rank|
                 name = rank["name"].encode("utf-8", "utf-8")
-                points = rank["points"].to_i
+                # the first rank (0 points in IPB) needs at least one point, so no member has a rank without activity
+                points = [rank["points"].to_i, 1].max
 
                 badge = Badge.find_or_initialize_by(name: name)
                 badge.assign_attributes(
-                    description: "Rang atteint à partir de #{points} points.",
+                    description: "Rang atteint à partir de #{points} #{points == 1 ? "point" : "points"}.",
                     badge_type_id: points >= 10_000 ? BadgeType::Gold : points >= 1_000 ? BadgeType::Silver : BadgeType::Bronze,
                     badge_grouping: grouping,
                     allow_title: true,
