@@ -195,6 +195,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     def execute
         import_users
+        import_avatars
         import_categories
         import_topics
         import_posts
@@ -211,6 +212,42 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         fix_internal_links
         import_ranks
         create_permalinks
+    end
+
+    # Separate from import_users so that a re-run adds the avatars of members imported before their file was available
+    def import_avatars
+        puts "", "importing avatars..."
+
+        # "none" members hold a letter-avatar color and "sync-*" ones a social network URL in pp_main_photo
+        members = mysql_query(<<~SQL).to_a
+            SELECT member_id AS id, pp_main_photo
+            FROM #{TABLE_PREFIX}core_members
+            WHERE pp_photo_type = 'custom' AND pp_main_photo <> ''
+        SQL
+        imported = 0
+        start_time = Time.now
+
+        members.each_with_index do |m, index|
+            print_status(index + 1, members.size, start_time)
+
+            user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
+            next if !user || user.uploaded_avatar_id
+
+            path = File.join(UPLOADS_DIR, m["pp_main_photo"].encode("utf-8", "utf-8"))
+            next unless File.exist?(path)
+
+            upload = create_upload(user.id, path, File.basename(path))
+            next unless upload&.persisted?
+
+            user.create_user_avatar unless user.user_avatar
+            user.user_avatar.update(custom_upload_id: upload.id)
+            user.update(uploaded_avatar_id: upload.id)
+            imported += 1
+        rescue StandardError => e
+            puts "", "Failed to upload avatar for user #{m["id"]}: #{e.message}"
+        end
+
+        puts "", "#{imported} avatars imported"
     end
 
     # Primary and secondary (mgroup_others) group memberships
@@ -288,8 +325,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     m.last_activity,
                     m.temp_ban AS member_banned,
                     m.member_group_id,
-                    NULLIF(p.#{about_me_column}, '') AS pp_about_me,
-                    m.pp_main_photo
+                    NULLIF(p.#{about_me_column}, '') AS pp_about_me
                 FROM #{TABLE_PREFIX}core_members AS m
                 LEFT JOIN #{TABLE_PREFIX}core_pfields_content AS p ON m.member_id = p.member_id
                 WHERE m.member_id > #{last_user_id}
@@ -348,23 +384,6 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                                 new_user.update(suspended_at: DateTime.now, suspended_till: 100.years.from_now)
                             elsif ban > Time.now.to_i
                                 new_user.update(suspended_at: DateTime.now, suspended_till: Time.zone.at(ban))
-                            end
-
-                            if u["pp_main_photo"].present?
-                                path = File.join(UPLOADS_DIR, u["pp_main_photo"])
-                                
-                                if File.exist?(path)
-                                    begin
-                                        upload = create_upload(new_user.id, path, File.basename(path))
-                                        if upload.persisted?
-                                            new_user.create_user_avatar
-                                            new_user.user_avatar.update(custom_upload_id: upload.id)
-                                            new_user.update(uploaded_avatar_id: upload.id)
-                                        end
-                                    rescue StandardError => e
-                                        puts "Failed to upload avatar for user #{u["id"]}: #{e.message}"
-                                    end
-                                end
                             end
                         end,
                 }   
