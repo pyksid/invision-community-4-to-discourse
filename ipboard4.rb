@@ -224,6 +224,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_groups
         import_ignored_users
         import_avatars
+        import_cover_photos
         import_password_hashes
         import_profile_fields
         import_categories
@@ -279,6 +280,44 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
 
         puts "", "#{imported} avatars imported"
+    end
+
+    # The IPB cover photo (profile header and hovercard) becomes both the profile and the user card background.
+    # Members whose file is not in UPLOADS_DIR are skipped, so a re-run picks up files added later
+    def import_cover_photos
+        puts "", "importing cover photos..."
+
+        members = mysql_query(<<~SQL).to_a
+            SELECT member_id AS id, pp_cover_photo
+            FROM #{TABLE_PREFIX}core_members
+            WHERE pp_cover_photo <> ''
+        SQL
+        imported = 0
+        start_time = Time.now
+
+        members.each_with_index do |m, index|
+            print_status(index + 1, members.size, start_time)
+
+            user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
+            profile = user&.user_profile
+            next if !profile || (profile.profile_background_upload_id && profile.card_background_upload_id)
+
+            path = File.join(UPLOADS_DIR, m["pp_cover_photo"].encode("utf-8", "utf-8"))
+            next unless File.exist?(path)
+
+            upload = create_upload(user.id, path, File.basename(path))
+            next unless upload&.persisted?
+
+            profile.update!(
+                profile_background_upload_id: profile.profile_background_upload_id || upload.id,
+                card_background_upload_id: profile.card_background_upload_id || upload.id,
+            )
+            imported += 1
+        rescue StandardError => e
+            puts "", "Failed to upload cover photo for user #{m["id"]}: #{e.message}"
+        end
+
+        puts "", "#{imported} cover photos imported"
     end
 
     # IPB4 bcrypt hashes for the discourse-migratepassword plugin: on login it checks the password against the
