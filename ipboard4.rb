@@ -196,6 +196,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     def execute
         import_users
         import_avatars
+        import_password_hashes
         import_categories
         import_topics
         import_posts
@@ -248,6 +249,35 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
 
         puts "", "#{imported} avatars imported"
+    end
+
+    # IPB4 bcrypt hashes for the discourse-migratepassword plugin: on login it checks the password against the
+    # hash, sets it as the Discourse password and deletes the hash. Members who already have a Discourse password
+    # are skipped so that a re-run never brings an old password back; ORDER BY keeps the first merged account's hash.
+    def import_password_hashes
+        puts "", "importing password hashes..."
+
+        members = mysql_query(<<~SQL).to_a
+            SELECT member_id AS id, members_pass_hash
+            FROM #{TABLE_PREFIX}core_members
+            WHERE members_pass_hash LIKE '$2%'
+            ORDER BY member_id
+        SQL
+        imported = 0
+        start_time = Time.now
+
+        members.each_with_index do |m, index|
+            print_status(index + 1, members.size, start_time)
+
+            user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
+            next if !user || user.has_password? || user.custom_fields["import_pass"].present?
+
+            user.custom_fields["import_pass"] = m["members_pass_hash"].encode("utf-8", "utf-8")
+            user.save_custom_fields
+            imported += 1
+        end
+
+        puts "", "#{imported} password hashes imported"
     end
 
     # Primary and secondary (mgroup_others) group memberships
