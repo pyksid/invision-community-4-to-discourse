@@ -157,6 +157,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     # Hosts (and path prefix) the forum was served from, so absolute links to it are treated as internal
     OLD_BASE_URLS = %w[community.lecrabeinfo.net lecrabeinfo.net/forums]
+    # IPB paths that a permalink redirects (see create_permalinks)
+    IPB_CONTENT_PATH = %r{\A/(?:topic|forum|profile|blogs/entry|blogs/blog)/\d+}
 
     # Reduce old IPB URLs to the keys create_permalinks stores (rules are "|"-separated, so no "|" inside)
     PERMALINK_NORMALIZATIONS = [
@@ -206,6 +208,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_private_messages
         import_private_message_replies
         sync_private_message_participants
+        fix_internal_links
         import_ranks
         create_permalinks
     end
@@ -1162,6 +1165,41 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         puts "#{removed} participants removed"
     end
 
+    # Once everything is imported: links clean_up left on an IPB path (their target was imported later) get
+    # their Discourse URL, and links whose text is an old forum URL become the bare Discourse URL, which
+    # Discourse shows as the topic title (inline) or a onebox (alone on its line)
+    def fix_internal_links
+        puts "", "fixing internal links..."
+
+        hosts = OLD_BASE_URLS.map { |host| Regexp.escape(host) }.join("|")
+        posts = Post
+            .joins("JOIN post_custom_fields f ON f.post_id = posts.id AND f.name = 'import_id'")
+            .where("posts.raw ~ ?", "\\]\\(/(topic|forum|profile|blogs)/|\\[[^]]*(#{hosts})")
+        total = posts.count
+        fixed = 0
+        start_time = Time.now
+
+        posts.find_each.with_index do |post, index|
+            # link text may hold one level of brackets ("[TUTO#2] …", "[…]")
+            raw = post.raw.gsub(/(?<!!)\[((?:\\.|[^\[\]\\]|\[[^\[\]]*\])*)\]\(([^)\s]+)\)/) do
+                link, text, target = $&, $1, $2
+                url = target.match?(IPB_CONTENT_PATH) ? discourse_url_for(target) : target
+                next link unless url&.match?(%r{\A/(?:t|c|u|tag)/})
+
+                ipb_path(text.gsub(/\\(.)/, '\1')) ? "#{Discourse.base_url}#{url}" : "[#{text}](#{url})"
+            end
+
+            if raw != post.raw
+                post.update_columns(raw: raw)
+                post.rebake!
+                fixed += 1
+            end
+            print_status(index + 1, total, start_time)
+        end
+
+        puts "", "#{fixed} posts fixed"
+    end
+
     # Old IPB URLs are reduced by PERMALINK_NORMALIZATIONS to "topic/<tid>", "comment/<pid>", "forum/<id>",
     # "profile/<member_id>", "blog-entry/<id>", "blog-comment/<id>" and "blog/<id>", which point to the imported records
     def create_permalinks
@@ -1328,7 +1366,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             path = ipb_path(a["href"])
             next unless path || a["href"].start_with?("<")
 
-            url = path && (discourse_url_for(path) || (path if path.match?(%r{\A/(?:topic|forum|profile|blogs/entry|blogs/blog)/\d+})))
+            url = path && (discourse_url_for(path) || (path if path.match?(IPB_CONTENT_PATH)))
             if url
                 a["href"] = url
             else
