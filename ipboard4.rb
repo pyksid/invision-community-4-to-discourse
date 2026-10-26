@@ -469,7 +469,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         batches(BATCH_SIZE) do |offset|
             topics = mysql_query(<<~SQL).to_a
-                SELECT t.tid AS id, t.title, t.state, t.starter_id, t.start_date, t.views, t.forum_id, t.pinned, p.post
+                SELECT t.tid AS id, t.title, t.state, t.starter_id, t.starter_name, t.start_date, t.views, t.forum_id, t.pinned, p.post
                 FROM #{TABLE_PREFIX}forums_topics t
                 JOIN #{TABLE_PREFIX}forums_posts p ON t.tid = p.topic_id
                 WHERE p.pdelete_time = 0
@@ -489,12 +489,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 next if post_id_from_imported_post_id("t-#{t["id"]}")
                 
                 created_at = Time.zone.at(t["start_date"])
-                user_id = user_id_from_imported_user_id(t["starter_id"])
-                
-                if user_id.nil?
-                    puts "Skipping topic #{t["id"]} - User ID #{t['starter_id']} not found"
-                    next
-                end
+                user_id = user_id_from_imported_user_id(t["starter_id"]) || anonymous_user_id(t["starter_name"])
                 {
                     id: "t-#{t["id"]}",
                     title: CGI.unescapeHTML(t["title"].encode("utf-8", "utf-8")),
@@ -525,7 +520,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     
         batches(BATCH_SIZE) do |offset|
             posts = mysql_query(<<~SQL).to_a
-                SELECT pid AS id, author_id, post_date, post, topic_id
+                SELECT pid AS id, author_id, author_name, post_date, post, topic_id
                 FROM #{TABLE_PREFIX}forums_posts
                 WHERE new_topic = 0
                 AND pdelete_time = 0
@@ -548,12 +543,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     next
                 end
 
-                user_id = user_id_from_imported_user_id(p["author_id"])
-
-                if user_id.nil?
-                    puts "Skipping post #{p["id"]} - User ID #{p["author_id"]} not found"
-                    next
-                end
+                user_id = user_id_from_imported_user_id(p["author_id"]) || anonymous_user_id(p["author_name"])
     
                 {
                     id: p["id"],
@@ -585,7 +575,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         batches(BATCH_SIZE) do |offset|
             entries = mysql_query(<<~SQL).to_a
-                SELECT entry_id AS id, entry_blog_id, entry_author_id, entry_name, entry_content, entry_cover_photo, entry_views,
+                SELECT entry_id AS id, entry_blog_id, entry_author_id, entry_author_name, entry_name, entry_content, entry_cover_photo, entry_views,
                     IF(entry_publish_date > 0, entry_publish_date, entry_date) AS published_at
                 FROM #{TABLE_PREFIX}blog_entries
                 WHERE entry_status = 'published'
@@ -602,11 +592,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             create_posts(entries, total: total_entries, offset: offset) do |e|
                 next if post_id_from_imported_post_id("b-#{e["id"]}")
 
-                user_id = user_id_from_imported_user_id(e["entry_author_id"])
-                if user_id.nil?
-                    puts "Skipping blog entry #{e["id"]} - User ID #{e["entry_author_id"]} not found"
-                    next
-                end
+                user_id = user_id_from_imported_user_id(e["entry_author_id"]) || anonymous_user_id(e["entry_author_name"])
 
                 raw = clean_up(e["entry_content"], user_id)
                 cover = upload_markdown("<fileStore.blog_Entries>/#{e["entry_cover_photo"]}", nil, user_id) if e["entry_cover_photo"].present?
@@ -634,7 +620,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         batches(BATCH_SIZE) do |offset|
             comments = mysql_query(<<~SQL).to_a
-                SELECT comment_id AS id, comment_entry_id, comment_member_id, comment_date, comment_text
+                SELECT comment_id AS id, comment_entry_id, comment_member_id, comment_member_name, comment_date, comment_text
                 FROM #{TABLE_PREFIX}blog_comments
                 WHERE comment_approved = 1
                 AND comment_id > #{last_comment_id}
@@ -652,11 +638,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 topic = topic_lookup_from_imported_post_id("b-#{c["comment_entry_id"]}")
                 next unless topic
 
-                user_id = user_id_from_imported_user_id(c["comment_member_id"])
-                if user_id.nil?
-                    puts "Skipping blog comment #{c["id"]} - User ID #{c["comment_member_id"]} not found"
-                    next
-                end
+                user_id = user_id_from_imported_user_id(c["comment_member_id"]) || anonymous_user_id(c["comment_member_name"])
 
                 {
                     id: "bc-#{c["id"]}",
@@ -1182,6 +1164,37 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         blank = { topic_id: nil, post_id: nil, category_id: nil, user_id: nil, tag_id: nil }
         rows.each_slice(BATCH_SIZE) { |slice| Permalink.insert_all(slice.map { |row| blank.merge(row) }) }
         puts "#{rows.size} permalinks processed"
+    end
+
+    # Content by deleted members or guests (author 0 or not imported) goes to one anonymized account per
+    # original name, shaped like Discourse's UserAnonymizer output: "anonNNNNNNNN", no profile, no email,
+    # no way to log in. Only a digest of the name is kept, to find the same account again on re-runs.
+    def anonymous_user_id(author_name)
+        key = Digest::SHA1.hexdigest(author_name.to_s.encode("utf-8", "utf-8", invalid: :replace, undef: :replace, replace: "").strip.downcase)
+        @anonymous_users ||= {}
+        @anonymous_users[key] ||= UserCustomField.find_by(name: "import_anon_key", value: key)&.user_id || create_anonymous_user(key)
+    end
+
+    def create_anonymous_user(key)
+        username = nil
+        username = "anon#{SecureRandom.random_number(100_000_000)}" while username.nil? || User.where(username_lower: username).exists?
+
+        user = User.create!(
+            username: username,
+            email: "#{username}#{UserAnonymizer::EMAIL_SUFFIX}",
+            password: SecureRandom.hex,
+            trust_level: TrustLevel[0],
+            active: true,
+            import_mode: true,
+        )
+        user.user_option.update!(
+            email_digests: false,
+            email_level: UserOption.email_level_types[:never],
+            email_messages_level: UserOption.email_level_types[:never],
+        )
+        user.custom_fields["import_anon_key"] = key
+        user.save_custom_fields
+        user.id
     end
 
     def staff_guardian
