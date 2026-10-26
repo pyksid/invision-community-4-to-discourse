@@ -14,6 +14,8 @@ DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PW=... DB_NAME=... TABLE_PREFIX=i
   IMPORT=1 bundle exec ruby script/import_scripts/ipboard4.rb
 ```
 
+`bench/` holds a local test bench (MariaDB copy of the IPB database + Discourse development container): setup in `bench/README.md`, `bench/import.sh` to run the import, `bench/checks.sql` for aggregate checks. The IPB copy holds production data: only run aggregate queries on it and never print emails, IPs, password hashes or private message content.
+
 Pitfalls seen when running it (Discourse dev container, late 2026):
 
 - In a Discourse **development** environment, set `RAILS_DISABLE_ACTIVERECORD_LOGS=1` and `DISCOURSE_DEV_LOG_LEVEL=warn`: dev SQL logging makes Logster keep a ~14 KB backtrace per log line in memory (RSS +20 MB/min, OOM-killed after a few hours) and triples import time. Production does not log SQL. Also preload jemalloc (`LD_PRELOAD=/usr/lib/libjemalloc.so`) as Discourse's `d/exec` does; with both, RSS stays ~600 MB at ~1000 posts/min.
