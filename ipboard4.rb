@@ -420,28 +420,29 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     # Members not seen for ARCHIVE_INACTIVE_AFTER_DAYS keep their username, avatar, cover photo and content (so
     # authorship, quotes, mentions and profile links survive) but no personal data: the email is replaced with an
     # unreachable address and IP addresses, birthday, password hash, location and user fields are dropped. They never
-    # get emails; a returning member asks staff to set their email. Runs on already imported users too.
+    # get emails; a returning member asks staff to set their email. Runs on already imported users too. Accounts
+    # merged from several IPB members (same normalized email) are archived only if all of them are inactive.
     def archive_inactive_users
         puts "", "archiving inactive users..."
 
-        staff_ids = fetch_admins + fetch_moderators
-        members = mysql_query(<<~SQL).to_a
-            SELECT member_id AS id
-            FROM #{TABLE_PREFIX}core_members
-            WHERE last_activity < #{ARCHIVE_INACTIVE_AFTER_DAYS.days.ago.to_i}
-            AND member_id NOT IN (#{(staff_ids + [0]).join(",")})
-        SQL
+        last_activity = Hash.new(0)
+        mysql_query("SELECT member_id, last_activity FROM #{TABLE_PREFIX}core_members").each do |m|
+            user_id = user_id_from_imported_user_id(m["member_id"])
+            last_activity[user_id] = [last_activity[user_id], m["last_activity"].to_i].max if user_id
+        end
+        cutoff = ARCHIVE_INACTIVE_AFTER_DAYS.days.ago.to_i
+        user_ids = last_activity.select { |_, time| time < cutoff }.keys
         archived = 0
         start_time = Time.now
 
-        members.each_with_index do |m, index|
-            print_status(index + 1, members.size, start_time)
+        user_ids.each_with_index do |user_id, index|
+            print_status(index + 1, user_ids.size, start_time)
 
-            user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
-            next if !user || archived?(user)
+            user = User.find_by(id: user_id)
+            next if !user || user.staff? || archived?(user)
 
             User.transaction do
-                user.primary_email.update!(email: "archived#{m["id"]}@archived.invalid")
+                user.primary_email.update!(email: "archived#{user.id}@archived.invalid")
                 user.update_columns(ip_address: nil, registration_ip_address: nil, date_of_birth: nil)
                 UserIpAddressHistory.where(user_id: user.id).delete_all
                 user.user_profile.update_column(:location, nil)
@@ -455,7 +456,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             end
             archived += 1
         rescue StandardError => e
-            puts "", "Failed to archive member #{m["id"]}: #{e.message}"
+            puts "", "Failed to archive user #{user_id}: #{e.message}"
         end
 
         puts "", "#{archived} inactive users archived"
