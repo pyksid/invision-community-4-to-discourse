@@ -11,6 +11,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     # IPB groups whose members become Discourse admins; other groups with ACP access become moderators
     ADMIN_GROUP_IDS = [4]
+    # IPB group id => Discourse group name (letters, digits, "_", 20 chars max); the IPB group name becomes the
+    # group's full name and title. Other IPB groups (members, guests, admins…) are not imported as groups.
+    GROUPS = { 6 => "moderateurs", 7 => "super_moderateurs", 8 => "helpers_securite" }
 
     # IPB reaction id => Discourse emoji (discourse-reactions plugin); "heart" is the Discourse like
     REACTION_EMOJIS = {
@@ -218,6 +221,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     def execute
         import_users
+        import_groups
         import_avatars
         import_password_hashes
         import_profile_fields
@@ -367,6 +371,40 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             field.requirement = :optional
             field.position = UserField.maximum(:position).to_i + 1
             definition[:options]&.each { |option| field.user_field_options.build(value: option) }
+        end
+    end
+
+    # Public groups for the IPB groups in GROUPS, with their primary and secondary members
+    def import_groups
+        puts "", "importing groups..."
+
+        GROUPS.each do |ipb_id, name|
+            full_name =
+                mysql_query(<<~SQL).first&.dig("name")&.encode("utf-8", "utf-8")
+                    SELECT word_default AS name FROM #{TABLE_PREFIX}core_sys_lang_words
+                    WHERE word_key = 'core_group_#{ipb_id}'
+                    AND lang_id = (SELECT lang_id FROM #{TABLE_PREFIX}core_sys_lang WHERE lang_default = 1)
+                SQL
+
+            group = Group.find_or_initialize_by(name: name)
+            if group.new_record?
+                group.assign_attributes(
+                    full_name: full_name,
+                    title: full_name,
+                    visibility_level: Group.visibility_levels[:public],
+                    members_visibility_level: Group.visibility_levels[:public],
+                    mentionable_level: Group::ALIAS_LEVELS[:everyone],
+                )
+                group.save!
+                group.custom_fields["import_id"] = ipb_id.to_s
+                group.save_custom_fields
+            end
+
+            user_ids = members_of_groups([ipb_id]).filter_map { |member_id| user_id_from_imported_user_id(member_id) }
+            added = (user_ids - group.group_users.pluck(:user_id)).each { |user_id| group.add(User.find(user_id)) }
+            puts "#{name}: #{added.size} members added"
+        rescue StandardError => e
+            puts "", "Failed to import group #{ipb_id}: #{e.message}"
         end
     end
 
