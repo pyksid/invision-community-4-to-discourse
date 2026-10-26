@@ -149,7 +149,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         ":shut-up-and-take-my-money-fry:" => "money_mouth_face",
     }
 
-    # Category holding IPB blog entries (one tag per blog, see blog_tags)
+    # Category holding IPB blog entries
     BLOG_CATEGORY_NAME = "Blogs"
 
     # Tag for every solved topic: topics flagged by the custom forums_topics.solved column have no answer post
@@ -609,14 +609,13 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
-    # IPB blogs are personal (one author each): entries become topics in BLOG_CATEGORY_NAME tagged with
-    # their blog's tag, comments become replies. Like forum topics, entries are imported open; drafts and
+    # IPB blogs are personal (one author each): entries become topics in BLOG_CATEGORY_NAME, comments become
+    # replies. Like forum topics, entries are imported open; drafts and
     # hidden/unapproved entries (entry_hidden is the approval flag, 1 = visible) are skipped.
     def import_blog_entries
         puts "", "importing blog entries..."
 
         category = create_category({ name: BLOG_CATEGORY_NAME }, "blogs")
-        tags = blog_tags
 
         last_entry_id = -1
         total_entries = mysql_count(<<~SQL)
@@ -628,7 +627,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
         batches(BATCH_SIZE) do |offset|
             entries = mysql_query(<<~SQL).to_a
-                SELECT entry_id AS id, entry_blog_id, entry_author_id, entry_author_name, entry_name, entry_content, entry_cover_photo, entry_views,
+                SELECT entry_id AS id, entry_author_id, entry_author_name, entry_name, entry_content, entry_cover_photo, entry_views,
                     IF(entry_publish_date > 0, entry_publish_date, entry_date) AS published_at
                 FROM #{TABLE_PREFIX}blog_entries
                 WHERE entry_status = 'published'
@@ -649,7 +648,6 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
                 raw = clean_up(e["entry_content"], user_id)
                 cover = upload_markdown("<fileStore.blog_Entries>/#{e["entry_cover_photo"]}", nil, user_id) if e["entry_cover_photo"].present?
-                tag = tags[e["entry_blog_id"].to_i]
 
                 {
                     id: "b-#{e["id"]}",
@@ -659,7 +657,6 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                     views: e["entry_views"],
                     category: category.id,
                     raw: cover ? "#{cover}\n\n#{raw}" : raw,
-                    post_create_action: proc { |post| DiscourseTagging.tag_topic_by_names(post.topic, staff_guardian, [tag], append: true) if tag },
                 }
             end
         end
@@ -704,33 +701,13 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
-    # blog_id => tag name "blog-<owner username>"; the tag description holds the blog's name
-    def blog_tags
-        @blog_tags ||= begin
-            SiteSetting.tagging_enabled = true
-            SiteSetting.max_tag_length = [SiteSetting.max_tag_length, 40].max
-
-            rows = mysql_query(<<~SQL).to_a
-                SELECT b.blog_id, b.blog_member_id, w.word_default AS name
-                FROM #{TABLE_PREFIX}blog_blogs b
-                LEFT JOIN #{TABLE_PREFIX}core_sys_lang_words w
-                    ON w.word_key = CONCAT('blogs_blog_', b.blog_id)
-                    AND w.lang_id = (SELECT lang_id FROM #{TABLE_PREFIX}core_sys_lang WHERE lang_default = 1)
-            SQL
-
-            rows.each_with_object({}) do |row, tags|
-                owner = User.find_by(id: user_id_from_imported_user_id(row["blog_member_id"]))
-                next unless owner
-
-                name = DiscourseTagging.clean_tag("blog-#{owner.username.parameterize}")
-                tag = Tag.find_or_create_by!(name: name)
-                description = row["name"].to_s.encode("utf-8", "utf-8", invalid: :replace, undef: :replace, replace: "")
-                tag.update!(description: description[0, 280]) if description.present?
-                tags[row["blog_id"].to_i] = name
-            rescue StandardError => e
-                puts "Error creating tag for blog #{row["blog_id"]}: #{e.message}"
+    # blog_id => Discourse id of the blog's owner, whose profile replaces the blog page
+    def blog_owners
+        @blog_owners ||=
+            mysql_query("SELECT blog_id, blog_member_id FROM #{TABLE_PREFIX}blog_blogs").each_with_object({}) do |row, owners|
+                user_id = user_id_from_imported_user_id(row["blog_member_id"])
+                owners[row["blog_id"].to_i] = user_id if user_id
             end
-        end
     end
 
     def configure_reactions
@@ -912,9 +889,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
-    # Followed topics/forums (and blog entries/blogs, as topics/blog tags): Discourse has no per-topic digest, so any notifying follow (immediate,
+    # Followed topics/forums (and blog entries, as topics): Discourse has no per-topic digest, so any notifying follow (immediate,
     # daily, weekly) becomes "watching" and a follow without notifications becomes "tracking".
-    # Member follows have no core equivalent and are skipped.
+    # Member and whole-blog follows have no core equivalent and are skipped.
     def import_follows
         puts "", "importing topic and forum subscriptions..."
 
@@ -922,7 +899,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             SELECT follow_area, follow_rel_id, follow_member_id, follow_notify_do, follow_notify_freq
             FROM #{TABLE_PREFIX}core_follow
             WHERE (follow_app = 'forums' AND follow_area IN ('topic', 'forum'))
-            OR (follow_app = 'blog' AND follow_area IN ('entry', 'blog'))
+            OR (follow_app = 'blog' AND follow_area = 'entry')
         SQL
 
         puts "Subscriptions to be processed: #{follows.size}"
@@ -942,11 +919,6 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
                     level = TopicUser.notification_levels[notify ? :watching : :tracking]
                     TopicUser.change(user.id, lookup[:topic_id], notification_level: level)
-                when "blog"
-                    tag = Tag.find_by(name: blog_tags[f["follow_rel_id"].to_i])
-                    next unless tag
-
-                    TagUser.change(user.id, tag.id, TagUser.notification_levels[notify ? :watching : :tracking])
                 else
                     category_id = category_id_from_imported_category_id(f["follow_rel_id"])
                     next unless category_id
@@ -1252,6 +1224,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     # Old IPB URLs are reduced by PERMALINK_NORMALIZATIONS to "topic/<tid>", "comment/<pid>", "forum/<id>",
     # "profile/<member_id>", "blog-entry/<id>", "blog-comment/<id>" and "blog/<id>", which point to the imported records
+    # (a blog to its owner's profile)
     def create_permalinks
         puts "", "creating permalinks..."
 
@@ -1286,13 +1259,10 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 end
             end
 
-        blog_tags.each do |blog_id, name|
-            tag = Tag.find_by(name: name)
-            rows << { url: "blog/#{blog_id}", tag_id: tag.id } if tag
-        end
+        blog_owners.each { |blog_id, user_id| rows << { url: "blog/#{blog_id}", user_id: user_id } }
 
         # insert_all needs the same keys on every row; it skips URLs that already have a permalink
-        blank = { topic_id: nil, post_id: nil, category_id: nil, user_id: nil, tag_id: nil }
+        blank = { topic_id: nil, post_id: nil, category_id: nil, user_id: nil }
         rows.each_slice(BATCH_SIZE) { |slice| Permalink.insert_all(slice.map { |row| blank.merge(row) }) }
         puts "#{rows.size} permalinks processed"
     end
@@ -1540,8 +1510,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             topic = topic_lookup_from_imported_post_id("b-#{entry_id}")
             Topic.find_by(id: topic[:topic_id])&.relative_url if topic
         elsif (blog_id = path[%r{\A/blogs/blog/(\d+)}, 1])
-            tag = blog_tags[blog_id.to_i]
-            "/tag/#{tag}" if tag
+            User.find_by(id: blog_owners[blog_id.to_i])&.relative_url
         end
     end
 
