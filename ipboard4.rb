@@ -222,6 +222,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     def execute
         import_users
         import_groups
+        import_ignored_users
         import_avatars
         import_password_hashes
         import_profile_fields
@@ -406,6 +407,35 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         rescue StandardError => e
             puts "", "Failed to import group #{ipb_id}: #{e.message}"
         end
+    end
+
+    # IPB ignore options per member: hiding their content (ignore_topics) becomes a Discourse ignore,
+    # otherwise ignoring their messages or mentions becomes a mute. Ignoring signatures only has no equivalent.
+    def import_ignored_users
+        puts "", "importing ignored users..."
+
+        rows = mysql_query(<<~SQL).to_a
+            SELECT ignore_owner_id, ignore_ignore_id, ignore_topics, ignore_messages, ignore_mentions
+            FROM #{TABLE_PREFIX}core_ignored_users
+            WHERE ignore_topics = 1 OR ignore_messages = 1 OR ignore_mentions = 1
+        SQL
+        imported = 0
+
+        rows.each do |row|
+            user_id = user_id_from_imported_user_id(row["ignore_owner_id"])
+            ignored_id = user_id_from_imported_user_id(row["ignore_ignore_id"])
+            next if !user_id || !ignored_id || user_id == ignored_id
+
+            if row["ignore_topics"] == 1
+                # IPB ignores do not expire; Discourse requires an expiry date
+                IgnoredUser.find_or_create_by!(user_id: user_id, ignored_user_id: ignored_id) { |ignore| ignore.expiring_at = 100.years.from_now }
+            else
+                MutedUser.find_or_create_by!(user_id: user_id, muted_user_id: ignored_id)
+            end
+            imported += 1
+        end
+
+        puts "#{imported} ignored users imported"
     end
 
     # Primary and secondary (mgroup_others) group memberships
