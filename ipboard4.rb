@@ -150,7 +150,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     }
 
     # Category holding IPB blog entries
-    BLOG_CATEGORY_NAME = "Blogs"
+    BLOG_CATEGORY_NAME = "Billets"
 
     # Tag for every solved topic: topics flagged by the custom forums_topics.solved column have no answer post
     SOLVED_TAG = "résolu"
