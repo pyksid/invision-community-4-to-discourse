@@ -6,7 +6,7 @@ require File.expand_path(File.dirname(__FILE__) + "/base.rb")
 
 class ImportScripts::IPBoard4 < ImportScripts::Base
     BATCH_SIZE = 5000
-    UPLOADS_DIR = "/path/to/uploads"
+    UPLOADS_DIR = ENV["UPLOADS_DIR"] || "/path/to/uploads"
     TABLE_PREFIX = ENV["TABLE_PREFIX"] || "ipb_"
 
     # IPB groups whose members become Discourse admins; other groups with ACP access become moderators
@@ -182,6 +182,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         @client =
         Mysql2::Client.new(
             host: ENV["DB_HOST"] || "localhost",
+            port: (ENV["DB_PORT"] || 3306).to_i,
             username: ENV["DB_USER"] || "root",
             password: ENV["DB_PW"],
             database: ENV["DB_NAME"],

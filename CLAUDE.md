@@ -10,13 +10,21 @@ Run from the Discourse root. `IMPORT=1` is required so Bundler loads the `:impor
 
 ```
 IMPORT=1 bundle install
-DB_HOST=localhost DB_USER=root DB_PW=... DB_NAME=... TABLE_PREFIX=ips_ \
+DB_HOST=localhost DB_PORT=3306 DB_USER=root DB_PW=... DB_NAME=... TABLE_PREFIX=ips_ \
   IMPORT=1 bundle exec ruby script/import_scripts/ipboard4.rb
 ```
 
+Pitfalls seen when running it (Discourse dev container, late 2026):
+
+- In a Discourse **development** environment, set `RAILS_DISABLE_ACTIVERECORD_LOGS=1` and `DISCOURSE_DEV_LOG_LEVEL=warn`: dev SQL logging makes Logster keep a ~14 KB backtrace per log line in memory (RSS +20 MB/min, OOM-killed after a few hours) and triples import time. Production does not log SQL. Also preload jemalloc (`LD_PRELOAD=/usr/lib/libjemalloc.so`) as Discourse's `d/exec` does; with both, RSS stays ~600 MB at ~1000 posts/min.
+- The import is resumable (every phase skips imported records), so wrapping it in a loop that re-runs it until it exits 0 is a safe guard against crashes.
+- `IMPORT=1 bundle install` can fail because Discourse's `Gemfile` declares `sqlite3` twice with different requirements (the `IMPORT` block vs `:generic_import`); align the requirement locally.
+- Starting the Discourse server without `IMPORT=1` rewrites `Gemfile.lock` without the import gems; run `IMPORT=1 bundle install` again before the next import.
+- `mysql2` needs the MySQL/MariaDB client headers (`apt-get install default-libmysqlclient-dev`) in the container.
+
 ## Configuration that is hardcoded and must be edited per site
 
-- `UPLOADS_DIR` — path to the IPB `uploads/` directory (avatars, attachments, `imageproxy/`, `emoticons/`).
+- `UPLOADS_DIR` (or the `UPLOADS_DIR` env var) — path to the IPB `uploads/` directory (avatars, attachments, `imageproxy/`, `emoticons/`, rank icons).
 - `about_me_column = "field_1"` in `import_users` — the `core_pfields_content` custom field holding the bio (map `pf_id` → label via `core_sys_lang_words` key `core_pfield_<id>`).
 - `ADMIN_GROUP_IDS` — IPB groups whose members become Discourse admins.
 - `REACTION_EMOJIS` / `REACTIONS_EXCLUDED_FROM_LIKE` — IPB reaction ids (`core_reactions`, labels in `reaction_title_<id>`) mapped to Discourse emojis.
