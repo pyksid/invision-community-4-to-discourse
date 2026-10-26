@@ -224,6 +224,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_categories
         import_topics
         import_posts
+        import_polls
         import_blog_entries
         import_blog_comments
         import_reactions
@@ -701,6 +702,111 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     # IPB blogs are personal (one author each): entries become topics in BLOG_CATEGORY_NAME, comments become
     # replies. Like forum topics, entries are imported open; drafts and
     # hidden/unapproved entries (entry_hidden is the approval flag, 1 = visible) are skipped.
+    # IPB polls (forums_topics.poll_state = core_polls.pid) are prepended to the topic's first post, one
+    # Discourse poll per IPB question. Votes of members who were not imported are kept as anonymous votes,
+    # so totals match IPB. Polls are created directly as PostCreator is not involved.
+    def import_polls
+        puts "", "importing polls..."
+
+        polls = mysql_query(<<~SQL).to_a
+            SELECT p.pid, t.tid, p.choices, p.votes, p.poll_view_voters, p.poll_closed, p.poll_close_date
+            FROM #{TABLE_PREFIX}core_polls p
+            JOIN #{TABLE_PREFIX}forums_topics t ON t.poll_state = p.pid
+            ORDER BY p.pid
+        SQL
+        imported = 0
+
+        polls.each do |p|
+            post = Post.find_by(id: post_id_from_imported_post_id("t-#{p["tid"]}"))
+            next if !post || post.polls.exists?
+
+            questions = JSON.parse(p["choices"].encode("utf-8", "utf-8")).sort_by { |key, _| key.to_i }
+            close_at = Time.zone.at(p["poll_close_date"]) if p["poll_close_date"].to_i > 0
+            closed = p["poll_closed"] == 1 || close_at&.past?
+
+            # question key => [Discourse poll name, IPB choice key => option index]
+            layout = {}
+            markdown =
+                questions.each_with_index.map do |(key, question), index|
+                    name = index == 0 ? DiscoursePoll::DEFAULT_POLL_NAME : "poll#{index + 1}"
+                    texts = []
+                    choice_indexes =
+                        question["choice"].sort_by { |choice_key, _| choice_key.to_i }.to_h do |choice_key, text|
+                            text = CGI.unescapeHTML(text.to_s).gsub(/\s+/, " ").strip
+                            texts << text unless texts.include?(text)
+                            [choice_key, texts.index(text)]
+                        end
+                    layout[key] = [name, choice_indexes]
+
+                    arguments = ["name=#{name}", "results=always"]
+                    arguments << (question["multi"] == 1 ? "type=multiple min=1 max=#{texts.size}" : "type=regular")
+                    arguments << "public=true" if p["poll_view_voters"] == 1
+                    arguments << "status=closed" if closed
+                    arguments << "close=#{close_at.iso8601}" if close_at
+
+                    title = CGI.unescapeHTML(question["question"].to_s).strip
+                    title = "# #{title}\n" if title.present?
+                    "[poll #{arguments.join(" ")}]\n#{title}#{texts.map { |text| "* #{text}" }.join("\n")}\n[/poll]"
+                end
+
+            # in one transaction, so that a failure does not leave the markdown prepended without polls
+            Post.transaction do
+                raw = "#{markdown.join("\n\n")}\n\n#{post.raw}"
+                post.update_columns(raw: raw)
+                DiscoursePoll::Poll.extract(raw, post.topic_id, post.user_id).each { |poll| DiscoursePoll::Poll.create!(post.id, poll) }
+                post.custom_fields[DiscoursePoll::HAS_POLLS] = true
+                post.save_custom_fields(true)
+                import_poll_votes(p, post, layout, questions.to_h)
+            end
+            post.rebake!
+            imported += 1
+        rescue StandardError => e
+            puts "", "Failed to import poll #{p["pid"]}: #{e.message}"
+        end
+
+        puts "", "#{imported} polls imported"
+    end
+
+    def import_poll_votes(ipb_poll, post, layout, questions)
+        discourse_polls = post.polls.includes(:poll_options).index_by(&:name)
+        votes = mysql_query("SELECT member_id, vote_date, member_choices FROM #{TABLE_PREFIX}core_voters WHERE poll = #{ipb_poll["pid"]}").to_a
+        voters = Hash.new { |hash, key| hash[key] = Set.new }
+
+        votes.each do |vote|
+            user_id = user_id_from_imported_user_id(vote["member_id"])
+            next unless user_id
+
+            JSON.parse(vote["member_choices"].to_s.encode("utf-8", "utf-8").presence || "{}").each do |key, choice_keys|
+                name, choice_indexes = layout[key]
+                poll = discourse_polls[name]
+                next unless poll
+
+                Array.wrap(choice_keys).filter_map { |choice_key| choice_indexes[choice_key.to_s] }.uniq.each do |index|
+                    option = poll.poll_options.sort_by(&:id)[index]
+                    PollVote.find_or_create_by!(poll: poll, poll_option: option, user_id: user_id) do |poll_vote|
+                        poll_vote.created_at = Time.zone.at(vote["vote_date"])
+                    end
+                end
+                voters[name] << user_id
+            end
+        end
+
+        # IPB counts include votes of deleted members
+        layout.each do |key, (name, choice_indexes)|
+            poll = discourse_polls[name]
+            next unless poll
+
+            ipb_counts = Hash.new(0)
+            questions[key]["votes"].to_h.each { |choice_key, count| ipb_counts[choice_indexes[choice_key]] += count.to_i }
+            poll.poll_options.sort_by(&:id).each_with_index do |option, index|
+                anonymous = ipb_counts[index] - option.poll_votes.count
+                option.update!(anonymous_votes: anonymous) if anonymous > 0
+            end
+            anonymous_voters = ipb_poll["votes"].to_i - voters[name].size
+            poll.update!(anonymous_voters: anonymous_voters) if anonymous_voters > 0
+        end
+    end
+
     def import_blog_entries
         puts "", "importing blog entries..."
 
