@@ -205,6 +205,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_articles
         import_private_messages
         import_private_message_replies
+        sync_private_message_participants
         import_ranks
         create_permalinks
     end
@@ -1069,8 +1070,18 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             create_posts(topics, total: total_topics, offset: offset) do |t|
                 next if post_id_from_imported_post_id("pm-t-#{t["id"]}")
 
-                user_id = user_id_from_imported_user_id(t["msg_author_id"]) || Discourse::SYSTEM_USER_ID
-                participant_ids = t["participants"].to_s.split(",").map { |id| user_id_from_imported_user_id(id) }.compact - [user_id]
+                author_id = user_id_from_imported_user_id(t["msg_author_id"])
+                user_id = author_id || Discourse::SYSTEM_USER_ID
+                active_ids = t["participants"].to_s.split(",")
+                participant_ids = active_ids.map { |id| user_id_from_imported_user_id(id) }.compact - [user_id]
+
+                # Everyone else left (or was deleted): the author alone still sees it in IPB. Discourse needs a
+                # recipient to create a PM, so the author is given as one and becomes the only participant.
+                # Conversations nobody can see any more are skipped.
+                if participant_ids.empty?
+                    next unless author_id && active_ids.include?(t["msg_author_id"].to_s)
+                    participant_ids = [author_id]
+                end
 
                 {
                     id: "pm-t-#{t["id"]}",
@@ -1123,6 +1134,32 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 }
             end
         end
+    end
+
+    # Discourse always lets the creator in and re-adds anyone who posts (PostCreator#ensure_in_allowed_users),
+    # so members who had left a conversation, and the system user, get access back; restore IPB's participants
+    def sync_private_message_participants
+        puts "", "syncing private message participants..."
+
+        participants = Hash.new { |h, k| h[k] = [] }
+        mysql_query(<<~SQL).each { |row| participants[row["topic_id"]] << row["user_id"] }
+            SELECT map_topic_id AS topic_id, map_user_id AS user_id
+            FROM #{TABLE_PREFIX}core_message_topic_user_map
+            WHERE map_user_active = 1
+        SQL
+
+        removed = 0
+        participants.each do |mt_id, member_ids|
+            topic = topic_lookup_from_imported_post_id("pm-t-#{mt_id}")
+            next unless topic
+
+            user_ids = member_ids.map { |id| user_id_from_imported_user_id(id) }.compact
+            next if user_ids.empty?
+
+            removed += TopicAllowedUser.where(topic_id: topic[:topic_id]).where.not(user_id: user_ids).delete_all
+        end
+
+        puts "#{removed} participants removed"
     end
 
     # Old IPB URLs are reduced by PERMALINK_NORMALIZATIONS to "topic/<tid>", "comment/<pid>", "forum/<id>",
