@@ -149,6 +149,29 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         ":shut-up-and-take-my-money-fry:" => "money_mouth_face",
     }
 
+    # core_pfields_content column copied to the native profile location
+    PROFILE_LOCATION_FIELD = "field_8"
+    # core_pfields_content columns => Discourse user fields (map pf_id → label via core_sys_lang_words key core_pfield_<id>).
+    # A multiselect field keeps the IPB values listed in options; aliases map other values found in the data to an option.
+    PROFILE_USER_FIELDS = {
+        "field_7" => {
+            name: "Système d'exploitation",
+            type: "multiselect",
+            options: [
+                "Windows 11", "Windows 10", "Windows 8", "Windows 7", "Windows XP", "Autre version de Windows",
+                "Debian", "Ubuntu", "Linux Mint", "Manjaro", "elementary OS", "KDE neon", "Fedora", "Arch Linux",
+                "Zorin OS", "Autre distribution Linux",
+            ],
+            aliases: { "Distribution GNU/Linux" => "Autre distribution Linux", "Autre distribution GNU/Linux" => "Autre distribution Linux" },
+        },
+        "field_11" => { name: "Modèle", type: "text" },
+        "field_2" => { name: "Processeur", type: "text" },
+        "field_3" => { name: "Carte mère", type: "text" },
+        "field_4" => { name: "Mémoire vive", type: "text" },
+        "field_5" => { name: "Stockage", type: "text" },
+        "field_6" => { name: "Carte graphique", type: "text" },
+    }
+
     # Category holding IPB blog entries
     BLOG_CATEGORY_NAME = "Billets"
 
@@ -197,6 +220,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         import_users
         import_avatars
         import_password_hashes
+        import_profile_fields
         import_categories
         import_topics
         import_posts
@@ -278,6 +302,71 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
 
         puts "", "#{imported} password hashes imported"
+    end
+
+    # Separate from import_users like import_avatars; only empty values are filled, so a re-run never
+    # overwrites what a member changed in Discourse
+    def import_profile_fields
+        puts "", "importing profile fields..."
+
+        fields = PROFILE_USER_FIELDS.to_h { |column, definition| [column, user_field(definition)] }
+        columns = [PROFILE_LOCATION_FIELD, *PROFILE_USER_FIELDS.keys]
+
+        members = mysql_query(<<~SQL).to_a
+            SELECT member_id AS id, #{columns.join(", ")}
+            FROM #{TABLE_PREFIX}core_pfields_content
+            WHERE #{columns.map { |column| "#{column} <> ''" }.join(" OR ")}
+        SQL
+        imported = 0
+        start_time = Time.now
+
+        members.each_with_index do |m, index|
+            print_status(index + 1, members.size, start_time)
+
+            user = User.find_by(id: user_id_from_imported_user_id(m["id"]))
+            next unless user
+
+            values = columns.to_h { |column| [column, CGI.unescapeHTML(m[column].to_s.encode("utf-8", "utf-8", invalid: :replace, undef: :replace, replace: "")).strip] }
+
+            location = values[PROFILE_LOCATION_FIELD]
+            user.user_profile.update_column(:location, location[0, 3000]) if location.present? && user.user_profile.location.blank?
+
+            fields.each do |column, field|
+                key = "#{User::USER_FIELD_PREFIX}#{field.id}"
+                next if values[column].blank? || user.custom_fields[key].present?
+
+                user.custom_fields[key] =
+                    if field.field_type == "multiselect"
+                        definition = PROFILE_USER_FIELDS[column]
+                        values[column].split(",").filter_map do |value|
+                            value = definition[:aliases].fetch(value.strip, value.strip)
+                            definition[:options].find { |option| option.casecmp?(value) }
+                        end.uniq.presence
+                    else
+                        values[column][0, UserField.max_length]
+                    end
+            end
+
+            user.save_custom_fields
+            imported += 1
+        rescue StandardError => e
+            puts "", "Failed to import profile fields for member #{m["id"]}: #{e.message}"
+        end
+
+        puts "", "#{imported} member profiles processed"
+    end
+
+    def user_field(definition)
+        UserField.find_or_create_by!(name: definition[:name]) do |field|
+            field.description = definition[:name]
+            field.field_type = definition[:type]
+            field.editable = true
+            field.show_on_profile = true
+            field.show_on_signup = false
+            field.requirement = :optional
+            field.position = UserField.maximum(:position).to_i + 1
+            definition[:options]&.each { |option| field.user_field_options.build(value: option) }
+        end
     end
 
     # Primary and secondary (mgroup_others) group memberships
