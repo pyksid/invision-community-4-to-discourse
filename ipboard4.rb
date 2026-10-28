@@ -8,6 +8,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     BATCH_SIZE = 5000
     UPLOADS_DIR = ENV["UPLOADS_DIR"] || "/path/to/uploads"
     TABLE_PREFIX = ENV["TABLE_PREFIX"] || "ipb_"
+    # WordPress site serving the old IPB Downloads files (lecrabeinfo.net, staging.lecrabeinfo.net, lecrabeinfo.test)
+    WP_SITE_DOMAIN = ENV["WP_SITE_DOMAIN"] || "lecrabeinfo.net"
 
     # IPB groups whose members become Discourse admins; other groups with ACP access become moderators
     ADMIN_GROUP_IDS = [4]
@@ -187,6 +189,8 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     OLD_BASE_URLS = %w[community.lecrabeinfo.net lecrabeinfo.net/forums]
     # IPB paths that a permalink redirects (see create_permalinks)
     IPB_CONTENT_PATH = %r{\A/(?:topic|forum|profile|blogs/entry|blogs/blog)/\d+}
+    # IPB Downloads paths (the app was served under /files, then /download), see wp_download_url
+    IPB_DOWNLOADS_PATH = %r{\A/(?:files|download)(?:[/?#]|\z)}
 
     # Reduce old IPB URLs to the keys create_permalinks stores (rules are "|"-separated, so no "|" inside)
     PERMALINK_NORMALIZATIONS = [
@@ -1547,7 +1551,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     def fix_internal_links
         puts "", "fixing internal links..."
 
-        hosts = OLD_BASE_URLS.map { |host| Regexp.escape(host) }.join("|")
+        hosts = old_hosts_pattern
         posts = Post
             .joins("JOIN post_custom_fields f ON f.post_id = posts.id AND f.name = 'import_id'")
             .where("posts.raw ~ ?", "\\]\\(/(topic|forum|profile|blogs)/|\\[[^]]*(#{hosts})")
@@ -1735,9 +1739,18 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
 
         # internal links point to the Discourse equivalent, or to the IPB path that a permalink
-        # redirects; other "<___base_url___>" links are unwrapped to keep their text
+        # redirects; other "<___base_url___>" links are unwrapped to keep their text. Links to IPB Downloads
+        # point to the WordPress download page; one whose text is an old forum URL becomes the bare new URL
         doc.css("a[href]").each do |a|
             path = ipb_path(a["href"])
+            if (url = wp_download_url(path))
+                if ipb_path(a.text)
+                    replace_with_text(a, placeholder(url))
+                else
+                    a["href"] = url
+                end
+                next
+            end
             next unless path || a["href"].start_with?("<")
 
             url = path && (discourse_url_for(path) || (path if path.match?(IPB_CONTENT_PATH)))
@@ -1746,6 +1759,14 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             else
                 a.replace(a.children)
             end
+        end
+
+        # bare IPB Downloads URLs in the text (scheme included, even mistyped as "ttps://")
+        downloads_url = %r{(?:<___base_url___>|(?:[a-z]*:)?//(?:www\.)?(?:#{old_hosts_pattern}))/?(?:index\.php\?/?)?(?:files|download)(?:[/?#][^\s<>"]*[^\s<>".,;:!?)\]]|/|(?![\w-]|\.\w))}i
+        doc.xpath(".//text()").each do |node|
+            next unless node.content.match?(downloads_url)
+
+            replace_with_text(node, node.content.gsub(downloads_url) { |url| placeholder(wp_download_url(ipb_path(url.sub(/\A[a-z]*:/i, "https:"))) || url) })
         end
 
         markdown = ReverseMarkdown.convert(doc.to_html).gsub("&nbsp;", " ")
@@ -1831,7 +1852,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
     # Path of an internal IPB URL relative to the forum root (e.g. "/topic/12-slug/"), nil for external URLs
     def ipb_path(url)
         url = CGI.unescapeHTML(url.to_s.strip)
-        hosts = OLD_BASE_URLS.map { |host| Regexp.escape(host) }.join("|")
+        hosts = old_hosts_pattern
 
         path =
             if url.start_with?("<___base_url___>")
@@ -1842,6 +1863,20 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         return unless path
 
         "/#{path.delete_prefix("/").delete_prefix("index.php?").delete_prefix("/")}".sub(%r{\A/forums/(?=(?:topic|forum|profile|blogs)/)}, "/")
+    end
+
+    def old_hosts_pattern
+        OLD_BASE_URLS.map { |host| Regexp.escape(host) }.join("|")
+    end
+
+    # WordPress download page for an IPB Downloads path (from ipb_path), as the forum's nginx redirects
+    # it: a file page (with any query, e.g. "?do=download") carries its id, which WordPress looks up in the
+    # "_ips_file_id" post meta; categories and anything else go to the downloads home. nil for other paths
+    def wp_download_url(path)
+        return unless path&.match?(IPB_DOWNLOADS_PATH)
+
+        file_id = path[%r{\A/(?:files|download)/file/(\d+)(?:-[^/?#]*)?/?(?:[?#]|\z)}, 1]
+        "https://#{WP_SITE_DOMAIN}/telecharger/#{"?ips_file_id=#{file_id}" if file_id}"
     end
 
     def discourse_url_for(path)
@@ -1877,6 +1912,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         elsif (match = src.match(%r{youtube(?:-nocookie)?\.com/embed/([^?&/]+)}))
             "https://www.youtube.com/watch?v=#{match[1]}"
         elsif (path = ipb_path(src))
+            url = wp_download_url(path)
+            return url if url
+
             url = discourse_url_for(path)
             "#{Discourse.base_url}#{url}" if url
         elsif src.match?(%r{\A(?:https?:)?//}i)

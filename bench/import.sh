@@ -17,6 +17,7 @@ docker exec -d -u discourse:discourse -w /src \
     -e IMPORT=1 \
     -e DB_HOST=host.docker.internal -e DB_PORT="${DB_PORT:-3307}" -e DB_USER="${DB_USER:-root}" -e DB_PW="${DB_PW:-local}" \
     -e DB_NAME="${DB_NAME:-ipb}" -e TABLE_PREFIX="${TABLE_PREFIX:-ips_}" -e UPLOADS_DIR=/ipb-uploads \
+    -e WP_SITE_DOMAIN="${WP_SITE_DOMAIN:-lecrabeinfo.net}" \
     -e LD_PRELOAD=/usr/lib/libjemalloc.so -e RUBY_GLOBAL_METHOD_CACHE_SIZE=131072 \
     -e RAILS_DISABLE_ACTIVERECORD_LOGS=1 -e DISCOURSE_DEV_LOG_LEVEL=warn \
     "$CONTAINER" tmp/run_import.sh
