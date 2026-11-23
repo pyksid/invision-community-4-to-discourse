@@ -13,8 +13,10 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     # IPB groups whose members become Discourse admins; other groups with ACP access become moderators
     ADMIN_GROUP_IDS = [4]
-    # Members (except staff) not seen for this many days get an archived account, see archive_inactive_users
+    # Members (except staff) not seen for this many days get an archived account, unless they wrote at least
+    # ARCHIVE_MIN_POSTS posts: those keep their account without emails, see archive_inactive_users
     ARCHIVE_INACTIVE_AFTER_DAYS = 365
+    ARCHIVE_MIN_POSTS = 10
     # IPB group id => Discourse group name (letters, digits, "_", 20 chars max); the IPB group name becomes the
     # group's full name and title. Other IPB groups (members, guests, admins…) are not imported as groups.
     GROUPS = { 6 => "moderateurs", 7 => "super_moderateurs", 8 => "helpers_securite" }
@@ -421,11 +423,13 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
         end
     end
 
-    # Members not seen for ARCHIVE_INACTIVE_AFTER_DAYS keep their username, avatar, cover photo and content (so
-    # authorship, quotes, mentions and profile links survive) but no personal data: the email is replaced with an
-    # unreachable address and IP addresses, birthday, password hash, location and user fields are dropped. They never
-    # get emails; a returning member asks staff to set their email. Runs on already imported users too. Accounts
-    # merged from several IPB members (same normalized email) are archived only if all of them are inactive.
+    # Members not seen for ARCHIVE_INACTIVE_AFTER_DAYS with fewer than ARCHIVE_MIN_POSTS posts keep their username,
+    # avatar, cover photo and content (so authorship, quotes, mentions and profile links survive) but no personal
+    # data: the email is replaced with an unreachable address and IP addresses, birthday, password hash, location and
+    # user fields are dropped. They never get emails; a returning member asks staff to set their email.
+    # Inactive members with more posts keep their account but get no emails (their old address may bounce) until they
+    # turn them back on. Runs on already imported users too. Accounts merged from several IPB members (same
+    # normalized email) count the activity and posts of all of them.
     def archive_inactive_users
         puts "", "archiving inactive users..."
 
@@ -434,9 +438,15 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             user_id = user_id_from_imported_user_id(m["member_id"])
             last_activity[user_id] = [last_activity[user_id], m["last_activity"].to_i].max if user_id
         end
+        posts = Hash.new(0)
+        imported_post_counts.each do |member_id, count|
+            user_id = user_id_from_imported_user_id(member_id)
+            posts[user_id] += count if user_id
+        end
         cutoff = ARCHIVE_INACTIVE_AFTER_DAYS.days.ago.to_i
         user_ids = last_activity.select { |_, time| time < cutoff }.keys
         archived = 0
+        dormant = 0
         start_time = Time.now
 
         user_ids.each_with_index do |user_id, index|
@@ -444,6 +454,21 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
             user = User.find_by(id: user_id)
             next if !user || user.staff? || archived?(user)
+
+            if posts[user_id] >= ARCHIVE_MIN_POSTS
+                next if UserCustomField.exists?(user_id: user.id, name: "import_dormant")
+
+                User.transaction do
+                    user.user_option.update!(
+                        email_digests: false,
+                        email_level: UserOption.email_level_types[:never],
+                        email_messages_level: UserOption.email_level_types[:never],
+                    )
+                    UserCustomField.create!(user_id: user.id, name: "import_dormant", value: "t")
+                end
+                dormant += 1
+                next
+            end
 
             User.transaction do
                 user.primary_email.update!(email: "archived#{user.id}@archived.invalid")
@@ -463,7 +488,21 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
             puts "", "Failed to archive user #{user_id}: #{e.message}"
         end
 
-        puts "", "#{archived} inactive users archived"
+        puts "", "#{archived} inactive users archived, #{dormant} kept without emails (#{ARCHIVE_MIN_POSTS}+ posts)"
+    end
+
+    # Posts each IPB member wrote that the import keeps: forum posts, blog entries and blog comments
+    def imported_post_counts
+        counts = Hash.new(0)
+        [
+            "SELECT author_id AS id, COUNT(*) AS count FROM #{TABLE_PREFIX}forums_posts
+                WHERE queued = 0 AND pdelete_time = 0 GROUP BY author_id",
+            "SELECT entry_author_id AS id, COUNT(*) AS count FROM #{TABLE_PREFIX}blog_entries
+                WHERE entry_status = 'published' AND entry_hidden = 1 GROUP BY entry_author_id",
+            "SELECT comment_member_id AS id, COUNT(*) AS count FROM #{TABLE_PREFIX}blog_comments
+                WHERE comment_approved = 1 GROUP BY comment_member_id",
+        ].each { |sql| mysql_query(sql).each { |row| counts[row["id"].to_i] += row["count"].to_i } }
+        counts
     end
 
     def archived?(user)

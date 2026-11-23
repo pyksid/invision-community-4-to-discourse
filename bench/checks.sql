@@ -13,6 +13,7 @@ SELECT
 \echo '== Users'
 SELECT
     (SELECT COUNT(*) FROM user_custom_fields WHERE name = 'import_archived') AS archived,
+    (SELECT COUNT(*) FROM user_custom_fields WHERE name = 'import_dormant') AS dormant,
     (SELECT COUNT(*) FROM user_custom_fields WHERE name = 'import_anon_key') AS anonymized,
     (SELECT COUNT(*) FROM user_custom_fields WHERE name = 'import_pass') AS password_hashes,
     (SELECT COUNT(*) FROM users WHERE id > 0 AND uploaded_avatar_id IS NOT NULL) AS avatars,
@@ -36,6 +37,20 @@ JOIN users u ON u.id = a.user_id
 JOIN user_emails e ON e.user_id = u.id AND e.primary
 JOIN user_profiles p ON p.user_id = u.id
 WHERE a.name = 'import_archived';
+
+\echo '== Inactive members kept with 10+ posts: real email, no emails sent (bad_* all zeros)'
+SELECT
+    COUNT(*) AS dormant,
+    COUNT(*) FILTER (WHERE e.email LIKE '%@archived.invalid') AS bad_archived_email,
+    COUNT(*) FILTER (WHERE o.email_level <> 2 OR o.email_messages_level <> 2 OR o.email_digests) AS bad_emails_on,
+    COUNT(*) FILTER (WHERE EXISTS (
+        SELECT 1 FROM user_custom_fields c WHERE c.user_id = u.id AND c.name = 'import_archived'
+    )) AS bad_also_archived
+FROM user_custom_fields d
+JOIN users u ON u.id = d.user_id
+JOIN user_emails e ON e.user_id = u.id AND e.primary
+JOIN user_options o ON o.user_id = u.id
+WHERE d.name = 'import_dormant';
 
 \echo '== User fields'
 SELECT f.name, COUNT(DISTINCT c.user_id) AS members
