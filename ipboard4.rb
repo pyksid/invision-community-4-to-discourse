@@ -670,7 +670,9 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
                 # With normalize_emails, Discourse treats addresses that differ only by dots or a "+suffix" as
                 # one; such duplicate IPB accounts (re-registrations) are merged into the account imported first
+                # Saved, not only added to the lookup: on a re-run the account may be archived, its email gone
                 if (existing = UserEmail.find_by_normalized(u["email"])&.user)
+                    UserCustomField.create!(user_id: existing.id, name: "import_id", value: u["id"].to_s)
                     add_user(u["id"].to_s, existing)
                     puts "", "Merged IPB member #{u["id"]} into #{existing.username} (same normalized email)"
                     next
