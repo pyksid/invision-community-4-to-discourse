@@ -38,6 +38,16 @@ JOIN user_emails e ON e.user_id = u.id AND e.primary
 JOIN user_profiles p ON p.user_id = u.id
 WHERE a.name = 'import_archived';
 
+\echo '== Imported accounts must be able to log in without re-confirming their email (0)'
+SELECT COUNT(*) AS unconfirmed_email
+FROM users u
+JOIN user_emails e ON e.user_id = u.id AND e.primary
+WHERE u.id > 0
+AND EXISTS (SELECT 1 FROM user_custom_fields c WHERE c.user_id = u.id AND c.name = 'import_id')
+AND NOT EXISTS (SELECT 1 FROM user_custom_fields c WHERE c.user_id = u.id AND c.name = 'import_archived')
+AND EXISTS (SELECT 1 FROM email_tokens t WHERE t.user_id = u.id)
+AND NOT EXISTS (SELECT 1 FROM email_tokens t WHERE t.user_id = u.id AND t.email = e.email AND t.confirmed);
+
 \echo '== Inactive members kept with 10+ posts: real email, no emails sent (bad_* all zeros)'
 SELECT
     COUNT(*) AS dormant,

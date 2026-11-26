@@ -229,6 +229,7 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
 
     def execute
         import_users
+        confirm_imported_emails
         archive_inactive_users
         import_groups
         import_ignored_users
@@ -713,6 +714,20 @@ class ImportScripts::IPBoard4 < ImportScripts::Base
                 }   
             end
         end
+    end
+
+    # IPS had validated these addresses. Discourse only confirms the signup email token of users created with
+    # a password, and refuses to log in a user whose email is not confirmed ("activate your account" email)
+    def confirm_imported_emails
+        puts "", "confirming imported emails..."
+
+        confirmed = EmailToken
+            .where(user_id: UserCustomField.where(name: "import_id").select(:user_id))
+            .where(confirmed: false, scope: EmailToken.scopes[:signup])
+            .where("email_tokens.email = (SELECT e.email FROM user_emails e WHERE e.user_id = email_tokens.user_id AND e.primary)")
+            .update_all(confirmed: true)
+
+        puts "#{confirmed} emails confirmed"
     end
 
     def import_categories
